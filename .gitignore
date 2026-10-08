@@ -1,0 +1,34 @@
+# Generated artifacts
+*.dll
+*.exe
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.rbz
+*.zip
+
+# Build caches
+.vscode/
+.vs/
+.idea/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Debug/
+**/Release/
+**/x64/
+build/
+out/
+cmake-build-*/
+
+# Local editor and operating-system files
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+desktop.ini

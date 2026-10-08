@@ -1,0 +1,20 @@
+* text=auto
+
+*.rb text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.java text eol=lf
+*.cs text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.dll binary
+*.exe binary
+*.obj binary
+*.lib binary
+*.pdb binary

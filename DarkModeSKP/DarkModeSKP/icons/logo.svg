@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-labelledby="title desc">
+  <title id="title">Dark Mode SKP</title>
+  <desc id="desc">A silver toggle with a gold crescent in its dark circular knob. The solid dark tile matches Auto Backup SKP exactly, without corner dots.</desc>
+  <rect id="tile" x="79.5" y="85.5" width="1095" height="1083" rx="185.5" fill="#242424"/>
+  <g id="dark-mode-toggle">
+    <rect x="217" y="411" width="820" height="432" rx="216" fill="#B5B6BA"/>
+    <circle cx="821" cy="627" r="196" fill="#242424"/>
+    <path id="crescent" fill="#E9B547" d="M820 487C747 507 706 582 724 650C744 725 827 765 897 733C923 721 944 701 957 677C909 704 849 693 812 650C773 604 777 537 820 487Z"/>
+  </g>
+</svg>
