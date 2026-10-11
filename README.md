@@ -8,6 +8,14 @@ DarkModeSKP is an experimental SketchUp extension that attempts to apply a dark 
 
 *The navigation cube in the top-right corner is the [Viewport Advanced SKP](https://extensions.sketchup.com/extension/cd54da6d-9823-4ac7-9135-974f8988d6a9) extension.*
 
+## License
+
+DarkModeSKP is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may view, download, compile, run, modify, and distribute this project for non-commercial purposes under those terms.
+
+Commercial use is not permitted. This includes selling or reselling the source code, binaries, or derivative works; paid redistribution; and incorporating any part of this project into a commercial product or service.
+
+Required Notice: Copyright 2026 DarkModeSKP Contributors
+
 ## Repository layout
 
 - `DarkModeSKP/` - SketchUp Ruby extension, UI, settings, and assets.
