@@ -1,6 +1,6 @@
-# DarkModeSKP
+# Dark Mode SKP
 
-> **Disclaimer:** DarkModeSKP is an independent project. It is not affiliated with, endorsed by, or sponsored by Trimble Inc. or SketchUp.
+> **Disclaimer:** Dark Mode SKP is an independent project. It is not affiliated with, endorsed by, or sponsored by Trimble Inc. or SketchUp.
 
 DarkModeSKP is an experimental SketchUp extension that attempts to apply a dark theme to Qt interface elements.
 
@@ -10,7 +10,7 @@ DarkModeSKP is an experimental SketchUp extension that attempts to apply a dark 
 
 ## License
 
-DarkModeSKP is source-available under the [DarkModeSKP Personal Use Source License](LICENSE). You may view, download, compile, run, and privately modify it for personal, non-commercial use.
+Dark Mode SKP is source-available under the [Dark ModeSKP Personal Use Source License](LICENSE). You may view, download, compile, run, and privately modify it for personal, non-commercial use.
 
 You may not redistribute any part of DarkModeSKP, including source code, binaries, packages, modified versions, or derivative works. This applies to free and paid distribution. Commercial use, resale, paid redistribution, and incorporation into a commercial product or service are also prohibited.
 
