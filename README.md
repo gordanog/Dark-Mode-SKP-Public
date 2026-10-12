@@ -2,7 +2,7 @@
 
 > **Disclaimer:** Dark Mode SKP is an independent project. It is not affiliated with, endorsed by, or sponsored by Trimble Inc. or SketchUp.
 
-DarkModeSKP is an experimental SketchUp extension that attempts to apply a dark theme to Qt interface elements.
+Dark Mode SKP is an experimental SketchUp extension that attempts to apply a dark theme to Qt interface elements.
 
 <img width="1906" height="1073" alt="image" src="https://github.com/user-attachments/assets/8591d74e-9288-4278-b061-46d6042a083f" />
 
@@ -73,6 +73,6 @@ Use this alternative when you do not want to build from source. Download the lat
 
 ## Use with caution
 
-DarkModeSKP is experimental and modifies SketchUp interface behavior. It may cause visual issues or instability
+Dark Mode SKP is experimental and modifies SketchUp interface behavior. It may cause visual issues or instability
 
 If SketchUp fails to start or becomes stuck after installation, close it completely. Open `%AppData%\SketchUp\SketchUp 20XX\SketchUp\Plugins` in File Explorer, replacing `20XX` with your installed SketchUp version. Delete only the `DarkModeSKP` folder and the `DarkModeSKP.rb` registration file, then restart SketchUp.
