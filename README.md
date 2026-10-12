@@ -10,11 +10,11 @@ DarkModeSKP is an experimental SketchUp extension that attempts to apply a dark 
 
 ## License
 
-DarkModeSKP is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may view, download, compile, run, modify, and distribute this project for non-commercial purposes under those terms.
+DarkModeSKP is source-available under the [DarkModeSKP Personal Use Source License](LICENSE). You may view, download, compile, run, and privately modify it for personal, non-commercial use.
 
-Commercial use is not permitted. This includes selling or reselling the source code, binaries, or derivative works; paid redistribution; and incorporating any part of this project into a commercial product or service.
+You may not redistribute any part of DarkModeSKP, including source code, binaries, packages, modified versions, or derivative works. This applies to free and paid distribution. Commercial use, resale, paid redistribution, and incorporation into a commercial product or service are also prohibited.
 
-Required Notice: Copyright 2026 DarkModeSKP Contributors
+Public access to this repository does not grant permission to publish, share, or otherwise distribute DarkModeSKP.
 
 ## Repository layout
 
