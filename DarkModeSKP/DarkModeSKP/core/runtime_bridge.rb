@@ -48,6 +48,10 @@ module RuntimeBridge
     native_helper_function('darkmode_skp_initialize', [], Fiddle::TYPE_INT)
   end
 
+  def self.prepare_icon_theme_function
+    native_helper_function('darkmode_skp_prepare_icon_theme', [Fiddle::TYPE_INT], Fiddle::TYPE_INT)
+  end
+
   def self.dark_mode_applied_function
     native_helper_function('darkmode_skp_dark_mode_applied', [], Fiddle::TYPE_INT)
   end
@@ -69,6 +73,14 @@ module RuntimeBridge
     return false unless available?
 
     initialize_native_helper_function.call.to_i == 1
+  rescue
+    false
+  end
+
+  def self.prepare_icon_theme(enabled)
+    return false unless available?
+
+    prepare_icon_theme_function.call(enabled ? 1 : 0).to_i == 1
   rescue
     false
   end

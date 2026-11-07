@@ -1,0 +1,12 @@
+phase=enabled
+enabled=1
+resource-colors=363
+chevron-resource-colors=0
+default-env-colors=0
+tray-chevron-pixmaps=11
+tray-chevron-widgets=2317
+tray-chevron-headers=11
+tray-hide-native-patches=0
+tray-hide-native-rebuilds=11
+component-navigator-search-icons=0
+page-tabs-search-icons=1

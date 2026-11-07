@@ -13,7 +13,7 @@ module Dialog
     dark_mode_applied = dark_mode_applied == true || dark_mode_applied.to_s == 'true'
     restart_required = state.fetch(:restart_required, dark_mode_enabled != dark_mode_applied)
     restart_required = restart_required == true || restart_required.to_s == 'true'
-    apply_dark_style = settings.fetch(:apply_dark_style, false) == true || settings.fetch(:apply_dark_style, false).to_s == 'true'
+    apply_dark_style = settings.fetch(:apply_dark_style, true) == true || settings.fetch(:apply_dark_style, true).to_s == 'true'
     body_class = environment_supported && dark_mode_applied ? 'dark-mode' : ''
     status_class = if !environment_supported
       'is-unsupported'
@@ -27,7 +27,7 @@ module Dialog
     status_text = if !environment_supported
       escape_html(state.fetch(:unsupported_message, UNSUPPORTED_ENVIRONMENT_MESSAGE))
     elsif restart_required
-      "SketchUp restart required to #{dark_mode_enabled ? 'enable' : 'disable'}"
+      "SketchUp restart required to #{dark_mode_enabled ? 'enable' : 'disable'}..."
     elsif dark_mode_applied
       'Enabled'
     else
@@ -538,7 +538,7 @@ module Dialog
             }
 
             if (statusName === 'restart-required') {
-              status.textContent = darkModeEnabled ? 'SketchUp restart required to enable' : 'SketchUp restart required to disable';
+              status.textContent = darkModeEnabled ? 'SketchUp restart required to enable...' : 'SketchUp restart required to disable...';
               status.classList.add('is-restart-required');
               return;
             }

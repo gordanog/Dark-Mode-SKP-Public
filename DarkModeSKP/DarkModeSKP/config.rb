@@ -11,7 +11,7 @@ module DarkModeSKP
 
   DEFAULT_SETTINGS = {
     dark_mode_enabled: false,
-    apply_dark_style: false
+    apply_dark_style: true
   }.freeze
 
 end

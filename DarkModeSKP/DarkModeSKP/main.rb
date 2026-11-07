@@ -223,6 +223,7 @@ module DarkModeSKP
   unless file_loaded?(__FILE__)
     if supported_environment?
       RuntimeBridge.initialize_native_helper
+      RuntimeBridge.prepare_icon_theme(truthy?(@settings[:dark_mode_enabled]))
       install_dark_style_observer
     end
     build_menu

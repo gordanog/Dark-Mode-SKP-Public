@@ -1,0 +1,3 @@
+parent-class=CComponentNavigatorDlg
+all-widgets=2283
+matching-widgets=0

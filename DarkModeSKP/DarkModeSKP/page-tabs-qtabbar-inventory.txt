@@ -1,0 +1,92 @@
+all-widgets=2638
+tabbar=0x269e8998c30 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x269e8998c30 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e875ddc0 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e8998210 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x269e86b6790 class=QObject vtable=0x7ff742354e50
+  ancestor=4 object=0x269e8dc8410 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x269541f9490 class=QObject vtable=0x7ff7426589d8
+  ancestor=0 object=0x269541f9490 class=QObject vtable=0x7ff7426589d8
+  ancestor=1 object=0x26953ee07a0 class=QObject vtable=0x7ffc4ff76980
+  ancestor=2 object=0x2695404d770 class=QObject vtable=0x7ffc4ff75d68
+  ancestor=3 object=0x2695400fde0 class=QObject vtable=0x7ffc4ff702a8
+  ancestor=4 object=0x26953fbdc50 class=QObject vtable=0x7ffc4ff74c38
+  ancestor=5 object=0x2695412e050 class=QObject vtable=0x7ff74233c770
+  ancestor=6 object=0x26953fb9330 class=QObject vtable=0x7ff742307b60
+  ancestor=7 object=0x26953ee8640 class=QObject vtable=0x7ff74233c2e8
+tabbar=0x269e9188a30 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x269e9188a30 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e910ff30 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e9188e20 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695b509480 class=QObject vtable=0x7ff74232f4b8
+  ancestor=4 object=0x269e8dc51d0 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x2695b5c4590 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x2695b5c4590 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e8746c60 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e86d5120 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695410a7a0 class=QObject vtable=0x7ff742325648
+  ancestor=4 object=0x269e8707720 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x26959210e30 class=QObject vtable=0x7ff742357e30
+  ancestor=0 object=0x26959210e30 class=QObject vtable=0x7ff742357e30
+  ancestor=1 object=0x26959205ad0 class=QObject vtable=0x7ff742346618
+  ancestor=2 object=0x26959b01170 class=QObject vtable=0x7ff74235f7b0
+  ancestor=3 object=0x26953fbd7d0 class=QObject vtable=0x7ff742307b60
+  ancestor=4 object=0x2695412ed50 class=QObject vtable=0x7ffc4ff773a8
+  ancestor=5 object=0x26953fba8f0 class=QObject vtable=0x7ffbed0f7af0
+  ancestor=6 object=0x26953ee07a0 class=QObject vtable=0x7ffc4ff76980
+  ancestor=7 object=0x2695404d770 class=QObject vtable=0x7ffc4ff75d68
+tabbar=0x2695b5c47d0 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x2695b5c47d0 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e8696860 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x2695b5cbfd0 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695aa99a00 class=QObject vtable=0x7ff74233fc78
+  ancestor=4 object=0x269e870e9e0 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x2695b5cbf10 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x2695b5cbf10 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e8695f50 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x2695b5cbfd0 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695aa99a00 class=QObject vtable=0x7ff74233fc78
+  ancestor=4 object=0x269e870e9e0 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x269e9188730 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x269e9188730 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e910f300 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e9188e20 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695b509480 class=QObject vtable=0x7ff74232f4b8
+  ancestor=4 object=0x269e8dc51d0 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x269e8999590 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x269e8999590 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e875d500 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e8998210 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x269e86b6790 class=QObject vtable=0x7ff742354e50
+  ancestor=4 object=0x269e8dc8410 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+tabbar=0x2695b5c5f70 class=QObject vtable=0x7ff7427940f0
+  ancestor=0 object=0x2695b5c5f70 class=QObject vtable=0x7ff7427940f0
+  ancestor=1 object=0x269e8747390 class=QObject vtable=0x7ff742793f40
+  ancestor=2 object=0x269e86d5120 class=QObject vtable=0x7ff742312bd0
+  ancestor=3 object=0x2695410a7a0 class=QObject vtable=0x7ff742325648
+  ancestor=4 object=0x269e8707720 class=QObject vtable=0x7ff742733210
+  ancestor=5 object=0x2695afeea90 class=QObject vtable=0x7ff742735fd8
+  ancestor=6 object=0x2695b34aab0 class=QObject vtable=0x7ffbed067dd0
+  ancestor=7 object=0x2695b34b290 class=QObject vtable=0x7ff742308250
+qt- tabbars=10
