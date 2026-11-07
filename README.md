@@ -1,8 +1,9 @@
+
 # DarkModeSKP
 
 DarkModeSKP is a Windows extension for SketchUp that applies a dark theme to Qt and native Windows interface elements. It combines a Ruby extension with a native C++ helper.
 
-<img width="1906" height="1073" alt="image" src="https://github.com/user-attachments/assets/6eb45ec4-a9aa-49de-a8ab-64a1644cbe3f" />
+<img width="1906" height="1073" alt="Screenshot 2026-11-07 121147" src="https://github.com/user-attachments/assets/fb002f7c-55cb-4e25-b7b5-09ca20ebbd81" />
 
 ## Repository layout
 
