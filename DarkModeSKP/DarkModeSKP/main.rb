@@ -22,6 +22,10 @@ module DarkModeSKP
   @settings ||= GlobalSettings.merge_with_defaults(DEFAULT_SETTINGS.dup)
   @dialog ||= nil
   @startup_applied ||= false
+  @dark_style_model_observers ||= {}
+  @dark_style_saving_models ||= {}
+  @dark_style_frame_observer ||= nil
+  @dark_style_frame_observer_id ||= nil
 
   class DarkStyleAppObserver < Sketchup::AppObserver
     def onNewModel(model)
@@ -30,6 +34,26 @@ module DarkModeSKP
 
     def onOpenModel(model)
       AG::DarkModeSKP.schedule_dark_style_apply(model)
+    end
+
+    def onCloseModel(model)
+      AG::DarkModeSKP.remove_dark_style_observers(model)
+    end
+  end
+
+  class DarkStyleModelObserver < Sketchup::ModelObserver
+    def onPreSaveModel(model)
+      AG::DarkModeSKP.prepare_dark_style_for_save(model)
+    end
+
+    def onPostSaveModel(model)
+      AG::DarkModeSKP.restore_dark_style_after_save(model)
+    end
+  end
+
+  class DarkStyleFrameObserver
+    def frameChange(_from_page, to_page, _percent_done)
+      AG::DarkModeSKP.apply_dark_style_for_scene_frame(to_page)
     end
   end
 
@@ -69,19 +93,90 @@ module DarkModeSKP
     return StyleManager.restore unless truthy?(enabled)
     return [true, nil] unless truthy?(@settings[:apply_dark_style])
 
+    install_dark_style_observers(Sketchup.active_model)
     StyleManager.apply
   end
 
   def self.schedule_dark_style_apply(model)
     return unless model && supported_environment?
 
+    install_dark_style_observers(model)
+    schedule_dark_style_reapply(model)
+  rescue
+    nil
+  end
+
+  def self.schedule_dark_style_reapply(model, active_model_only = true)
+    return unless model && supported_environment?
+    return if dark_style_save_in_progress?(model)
+
     UI.start_timer(0.0, false) do
-      if model == Sketchup.active_model &&
-         RuntimeBridge.dark_mode_applied? &&
-         truthy?(@settings[:apply_dark_style])
-        StyleManager.apply
+      if (!active_model_only || model == Sketchup.active_model) &&
+         !dark_style_save_in_progress?(model) &&
+         dark_style_should_be_active?
+        StyleManager.apply(model)
       end
     end
+  rescue
+    nil
+  end
+
+  def self.apply_dark_style_for_scene_frame(to_page)
+    model = Sketchup.active_model
+    return unless model && to_page
+    return if dark_style_save_in_progress?(model)
+    return unless dark_style_should_be_active?
+
+    StyleManager.apply(model)
+  end
+
+  def self.prepare_dark_style_for_save(model)
+    return unless model
+
+    @dark_style_saving_models[model.object_id] = true if StyleManager.prepare_for_save(model)
+  end
+
+  def self.restore_dark_style_after_save(model)
+    return unless @dark_style_saving_models.delete(model.object_id)
+
+    schedule_dark_style_reapply(model, false)
+  end
+
+  def self.dark_style_should_be_active?
+    RuntimeBridge.dark_mode_applied? && truthy?(@settings[:apply_dark_style])
+  end
+
+  def self.dark_style_save_in_progress?(model)
+    @dark_style_saving_models.key?(model.object_id)
+  end
+
+  def self.install_dark_style_observers(model)
+    return unless model
+
+    model_key = model.object_id
+    unless @dark_style_model_observers[model_key]
+      observer = DarkStyleModelObserver.new
+      model.add_observer(observer)
+      @dark_style_model_observers[model_key] = observer
+    end
+    install_dark_style_frame_observer
+  end
+
+  def self.install_dark_style_frame_observer
+    return if @dark_style_frame_observer_id
+
+    @dark_style_frame_observer = DarkStyleFrameObserver.new
+    @dark_style_frame_observer_id = Sketchup::Pages.add_frame_change_observer(@dark_style_frame_observer)
+  end
+
+  def self.remove_dark_style_observers(model)
+    return unless model
+
+    model_key = model.object_id
+    model_observer = @dark_style_model_observers.delete(model_key)
+    model.remove_observer(model_observer) if model_observer
+    @dark_style_saving_models.delete(model_key)
+    StyleManager.clear_session(model)
   rescue
     nil
   end
@@ -142,6 +237,7 @@ module DarkModeSKP
     if ok
       @settings[:dark_mode_enabled] = enabled
       persist_settings if persist
+      install_dark_style_observers(Sketchup.active_model) if enabled
       style_ok, style_message = set_dark_style_enabled(enabled)
       refresh_dialog_state
       [style_ok, style_message]
@@ -225,6 +321,7 @@ module DarkModeSKP
       RuntimeBridge.initialize_native_helper
       RuntimeBridge.prepare_icon_theme(truthy?(@settings[:dark_mode_enabled]))
       install_dark_style_observer
+      install_dark_style_observers(Sketchup.active_model)
     end
     build_menu
     apply_startup_settings
