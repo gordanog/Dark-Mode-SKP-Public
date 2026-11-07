@@ -5,6 +5,8 @@ DarkModeSKP is a Windows extension for SketchUp that applies a dark theme to Qt 
 
 <img width="1906" height="1073" alt="Screenshot 2026-11-07 121147" src="https://github.com/user-attachments/assets/fb002f7c-55cb-4e25-b7b5-09ca20ebbd81" />
 
+*The navigation cube in the top-right corner is the [Viewport Advanced SKP](https://extensions.sketchup.com/extension/cd54da6d-9823-4ac7-9135-974f8988d6a9) extension.*
+
 ## Repository layout
 
 - `DarkModeSKP/` - SketchUp Ruby extension, UI, settings, and assets.
