@@ -8,6 +8,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1120,7 +1122,7 @@ struct QtLookup {
   std::string widget_window_title_symbol;
 };
 
-QtLookup resolve_qt_lookup() {
+QtLookup build_qt_lookup() {
   QtLookup lookup;
   lookup.core_modules = loaded_modules_matching(
     {L"Qt6Core.dll", L"Qt5Core.dll"},
@@ -1388,6 +1390,36 @@ QtLookup resolve_qt_lookup() {
   }, lookup.widget_window_title_module, lookup.widget_window_title_symbol);
 
   return lookup;
+}
+
+const QtLookup& resolve_qt_lookup() {
+  // SketchUp owns Qt for its application lifetime. Publish one immutable lookup
+  // so show/paint callbacks need neither module snapshots, string copies nor a
+  // mutex after initialization. Retry if called before Qt finishes loading.
+  static QtLookup cached_lookup;
+  static std::atomic<bool> lookup_ready{false};
+  if (lookup_ready.load(std::memory_order_acquire)) {
+    return cached_lookup;
+  }
+
+  static std::mutex lookup_mutex;
+  std::lock_guard<std::mutex> lock(lookup_mutex);
+  if (lookup_ready.load(std::memory_order_relaxed)) {
+    return cached_lookup;
+  }
+
+  QtLookup lookup = build_qt_lookup();
+  if (!lookup.core_modules.empty() && !lookup.gui_modules.empty() && !lookup.widgets_modules.empty() &&
+      lookup.instance_proc && lookup.from_utf8_proc && lookup.widget_find_proc &&
+      lookup.object_inherits_proc && lookup.widget_set_palette_proc && lookup.qpalette_destructor_proc) {
+    cached_lookup = std::move(lookup);
+    lookup_ready.store(true, std::memory_order_release);
+    return cached_lookup;
+  }
+
+  thread_local QtLookup incomplete_lookup;
+  incomplete_lookup = std::move(lookup);
+  return incomplete_lookup;
 }
 
 std::string describe_qt_lookup(const QtLookup& lookup) {
@@ -1847,7 +1879,7 @@ bool apply_qmenu_hover_stylesheet(void* menu) {
     return false;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   if (!lookup.from_utf8_proc || !lookup.widget_set_stylesheet_proc || !lookup.widget_stylesheet_proc ||
       !lookup.qstring_destructor_proc) {
     return false;
@@ -2598,7 +2630,7 @@ bool qwidget_is_self_or_descendant(const QtLookup& lookup, void* widget, void* a
 }
 
 int probe_focused_qt_widget() {
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   if (!lookup.app_focus_widget_proc) {
     return 0;
   }
@@ -3004,7 +3036,7 @@ bool apply_about_sketchup_palette(bool dark) {
     return false;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   void* root_widget = qwidget_for_hwnd(lookup, g_about_sketchup_window);
   if (!root_widget || !pointer_looks_like_cpp_object(root_widget)) {
     return false;
@@ -3110,11 +3142,12 @@ void CALLBACK qmenu_window_event(
   DWORD
 ) {
   if (object_id != OBJID_WINDOW || child_id != 0 || GetCurrentThreadId() != g_qmenu_window_hook_thread_id ||
-      InterlockedCompareExchange(&g_dark_mode_enabled, 0, 0) == 0) {
+      InterlockedCompareExchange(&g_dark_mode_enabled, 0, 0) == 0 ||
+      !hwnd || !IsWindow(hwnd) || GetAncestor(hwnd, GA_ROOT) != hwnd) {
     return;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   void* widget = qwidget_for_hwnd(lookup, hwnd);
   if (!widget || !pointer_looks_like_cpp_object(widget)) {
     return;
@@ -3158,29 +3191,36 @@ bool install_qmenu_window_hook() {
 
 bool icon_theme_enabled();
 void write_icon_theme_status(const char* phase);
-bool refresh_page_tabs_search_icon(const QtLookup& lookup);
+bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget = nullptr);
 
 void CALLBACK page_tabs_search_refresh_window_event(
   HWINEVENTHOOK,
   DWORD,
-  HWND,
-  LONG,
-  LONG,
+  HWND hwnd,
+  LONG object_id,
+  LONG child_id,
   DWORD,
   DWORD
 ) {
-  if (GetCurrentThreadId() != g_page_tabs_search_refresh_hook_thread_id || !icon_theme_enabled() ||
+  if (object_id != OBJID_WINDOW || child_id != 0 || !hwnd || !IsWindow(hwnd) ||
+      GetCurrentThreadId() != g_page_tabs_search_refresh_hook_thread_id || !icon_theme_enabled() ||
       InterlockedCompareExchange(&g_icon_theme_page_tabs_search_icon_count, 0, 0) != 0) {
     return;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
-  if (!refresh_page_tabs_search_icon(lookup)) {
+  const QtLookup& lookup = resolve_qt_lookup();
+  void* widget = qwidget_for_hwnd(lookup, hwnd);
+  if (!widget || InterlockedCompareExchange(&g_icon_theme_page_tabs_search_icon_count, -1, 0) != 0) {
     return;
   }
 
-  InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, 1);
-  write_icon_theme_status("enabled");
+  // Limit late icon repair to the window that actually appeared. A missing or
+  // version-specific icon must not cause an allWidgets scan on every event.
+  const bool refreshed = refresh_page_tabs_search_icon(lookup, widget);
+  InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, refreshed ? 1 : 0);
+  if (refreshed) {
+    write_icon_theme_status("enabled");
+  }
 }
 
 bool install_page_tabs_search_refresh_hook() {
@@ -3258,7 +3298,7 @@ bool read_application_window_rgb(const QtLookup& lookup, unsigned int& rgba) {
 }
 
 bool application_palette_is_dark() {
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   if (!lookup.app_palette_class_proc || !lookup.qpalette_destructor_proc || !lookup.qpalette_color_group_role_proc || !lookup.qcolor_rgb_proc) {
     return false;
   }
@@ -3755,7 +3795,7 @@ std::vector<void*> collect_clicked_childat_qwidgets(const QtLookup& lookup, POIN
 }
 
 int probe_dimensions_cursor_widget() {
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   POINT point = {};
   if (!GetCursorPos(&point)) {
     return 0;
@@ -5051,7 +5091,7 @@ size_t refresh_toolbutton_icon_pixmaps(const QtLookup& lookup) {
   return refreshed_count;
 }
 
-bool refresh_page_tabs_search_icon(const QtLookup& lookup) {
+bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget) {
   constexpr size_t page_tabs_primary_vtable_rva = 0x1c96618;
   constexpr size_t page_tabs_qwidget_vtable_rva = 0x1c96790;
   if (!lookup.app_all_widgets_proc || !lookup.widget_parent_widget_proc ||
@@ -5067,6 +5107,30 @@ bool refresh_page_tabs_search_icon(const QtLookup& lookup) {
       !memory_readable(expected_primary_vtable, sizeof(void*)) ||
       !memory_readable(expected_qwidget_vtable, sizeof(void*))) {
     return false;
+  }
+
+  using QtParentWidgetFn = void*(__cdecl*)(const void*);
+  using QtWidgetNoArgFn = void(__cdecl*)(void*);
+
+  void* page_tabs = nullptr;
+  if (shown_widget) {
+    // Most show events belong to unrelated dialogs or controls. Check only a
+    // bounded parent chain before resolving icon symbols or walking children.
+    void* current = shown_widget;
+    for (int depth = 0; current && depth < 8; ++depth) {
+      if (!pointer_looks_like_cpp_object(current)) {
+        return false;
+      }
+      const void* vtable = *reinterpret_cast<const void* const*>(current);
+      if (vtable == expected_primary_vtable || vtable == expected_qwidget_vtable) {
+        page_tabs = current;
+        break;
+      }
+      current = reinterpret_cast<QtParentWidgetFn>(lookup.widget_parent_widget_proc)(current);
+    }
+    if (!page_tabs) {
+      return false;
+    }
   }
 
   std::string icon_getter_module;
@@ -5088,11 +5152,14 @@ bool refresh_page_tabs_search_icon(const QtLookup& lookup) {
     return false;
   }
 
-  using QtParentWidgetFn = void*(__cdecl*)(const void*);
-  using QtWidgetNoArgFn = void(__cdecl*)(void*);
-
   std::vector<void*> widgets;
-  static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, 4096));
+  if (page_tabs) {
+    std::unordered_set<std::uintptr_t> visited;
+    collect_qwidget_descendants_from_qobject(lookup, page_tabs, 0, 8, widgets, 256, visited, "Page tabs", true);
+  } else {
+    // Full discovery is reserved for explicit theme application at startup.
+    static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, 4096));
+  }
   for (void* widget : widgets) {
     if (!pointer_looks_like_cpp_object(widget) || !qt_object_inherits(lookup, widget, "QPushButton")) {
       continue;
@@ -5382,7 +5449,7 @@ void __fastcall tray_hide_icon_add_file_hook(void* icon, const void* file_name, 
     _ReturnAddress() == image_base + tray_hide_icon_builder_return_rva;
   if (original_proc && from_tray_hide_icon_builder && icon_theme_enabled() && !g_tray_hide_icon_patching) {
     g_tray_hide_icon_patching = true;
-    const QtLookup lookup = resolve_qt_lookup();
+    const QtLookup& lookup = resolve_qt_lookup();
     if (qstring_to_utf8(lookup, file_name) == k_tray_hide_icon_resource_alias) {
       const size_t patched_count = patch_icon_theme_qresource_svg(lookup, k_tray_hide_icon_resource_alias);
       if (patched_count > 0) {
@@ -5623,7 +5690,7 @@ bool configure_icon_theme(bool enabled) {
   InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, 0);
   write_icon_theme_status("initializing");
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   const size_t resource_patch_count = apply_icon_theme_resource_patches(lookup);
   if (resource_patch_count == 0) {
     set_theme_info("Dark Mode SKP icon patch: stock SVG resources were unavailable.");
@@ -6190,7 +6257,7 @@ void __fastcall content_browser_draw_text_flags_hook(void* painter, const void* 
 
 void remove_content_browser_text_hooks() {
   g_content_browser_text_dark = false;
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   size_t reset_count = 0;
   if (lookup.widget_repaint_proc) {
     using QtWidgetNoArgFn = void(__cdecl*)(void*);
@@ -6281,7 +6348,7 @@ bool install_content_browser_text_hooks(bool dark) {
     return false;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   std::string draw_text_option_module;
   std::string draw_text_option_symbol;
   const FARPROC draw_text_option_proc = find_export(lookup.gui_modules, {
@@ -6511,7 +6578,7 @@ bool install_component_navigator_paint_hook(bool dark) {
     return true;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   const std::vector<void**> draw_text_option_iat_slots = find_main_import_iat_slots_for_symbols({
     "?drawText@QPainter@@QEAAXAEBVQRectF@@AEBVQString@@AEBVQTextOption@@@Z"
   });
@@ -6847,7 +6914,7 @@ void __fastcall entity_info_input_paint_hook(void* widget, void* event) {
   }
 
   if (g_entity_info_input_paint_dark && !g_entity_info_input_palette_applying) {
-    const QtLookup lookup = resolve_qt_lookup();
+    const QtLookup& lookup = resolve_qt_lookup();
     if (is_entity_info_input_widget(lookup, widget)) {
       g_entity_info_input_palette_applying = true;
       if (lookup.widget_set_attribute_proc) {
@@ -7469,7 +7536,7 @@ void __fastcall vcb_status_paint_hook(void* widget, void* event) {
   unsigned char original_fill_color[16] = {};
   bool fill_color_overridden = false;
   if (g_vcb_status_paint_dark && widget) {
-    const QtLookup lookup = resolve_qt_lookup();
+    const QtLookup& lookup = resolve_qt_lookup();
     constexpr size_t fill_color_offset = 0x48;
     if (lookup.qcolor_set_rgb_proc && memory_readable(reinterpret_cast<unsigned char*>(widget) + fill_color_offset, sizeof(original_fill_color))) {
       std::memcpy(original_fill_color, reinterpret_cast<unsigned char*>(widget) + fill_color_offset, sizeof(original_fill_color));
@@ -8061,7 +8128,7 @@ void __cdecl qmenu_popup_hook(void* menu, const void* position, void* action) {
   }
 
   if (InterlockedCompareExchange(&g_dark_mode_enabled, 0, 0) != 0 && menu) {
-    const QtLookup lookup = resolve_qt_lookup();
+    const QtLookup& lookup = resolve_qt_lookup();
     static_cast<void>(apply_non_customizable_toolbar_hover_palette_to_widget(lookup, menu, true));
   }
 
@@ -8124,7 +8191,7 @@ void __fastcall focus_returner_double_spin_box_change_event_hook(void* spin_box,
   }
 
   g_focus_returner_double_spin_box_palette_applying = true;
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   static_cast<void>(apply_clicked_palette_to_widget(lookup, spin_box, true));
   g_focus_returner_double_spin_box_palette_applying = false;
 }
@@ -8170,7 +8237,7 @@ size_t apply_scene_tab_search_dialog_palette(void* dialog) {
     return 0;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
   if (!lookup.app_all_widgets_proc || !lookup.object_parent_proc) {
     return 0;
   }
@@ -8356,7 +8423,7 @@ bool probe_qt_stage(int stage) {
     return false;
   }
 
-  const QtLookup lookup = resolve_qt_lookup();
+  const QtLookup& lookup = resolve_qt_lookup();
 
   if (stage == 47 || stage == 48) {
     const size_t changed_count = apply_windows_dark_mode(stage == 47);
@@ -8474,7 +8541,7 @@ bool probe_qt_stage(int stage) {
 bool call_qt_stylesheet(bool enabled) {
   const int palette_stage = enabled ? 45 : 46;
   const int windows_stage = enabled ? 47 : 48;
-  const QtLookup tags_header_lookup = resolve_qt_lookup();
+  const QtLookup& tags_header_lookup = resolve_qt_lookup();
   size_t tag_header_color_count = 0;
   size_t entity_info_input_surface_count = 0;
   if (!enabled) {
