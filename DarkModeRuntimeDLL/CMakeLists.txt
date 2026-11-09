@@ -35,9 +35,22 @@ set_target_properties(DarkModeRuntimeDLL PROPERTIES
 )
 
 set(DARKMODE_EXTENSION_DLL "${CMAKE_SOURCE_DIR}/../DarkModeSKP/DarkModeSKP/main.dll")
-add_custom_command(TARGET DarkModeRuntimeDLL POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "$<TARGET_FILE:DarkModeRuntimeDLL>"
-    "${DARKMODE_EXTENSION_DLL}"
-  COMMENT "Copying main.dll into the Dark Mode SKP extension"
-)
+option(DARKMODE_DEPLOY_PLUGIN_RUNTIME "Copy the runtime into the extension after building" ON)
+if(DARKMODE_DEPLOY_PLUGIN_RUNTIME)
+  add_custom_command(TARGET DarkModeRuntimeDLL POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:DarkModeRuntimeDLL>"
+      "${DARKMODE_EXTENSION_DLL}"
+    COMMENT "Copying main.dll into the Dark Mode SKP extension"
+  )
+endif()
+
+option(DARKMODE_BUILD_TOOLBAR_TITLE_TEST "Build the installed-Qt toolbar title rendering test" OFF)
+set(DARKMODE_QT_TEST_DIR "" CACHE PATH "Directory containing SketchUp's Qt6 DLLs")
+if(DARKMODE_BUILD_TOOLBAR_TITLE_TEST)
+  include(CTest)
+  add_executable(DarkModeToolbarTitleTest tests/test_floating_toolbar_title.cpp)
+  target_link_libraries(DarkModeToolbarTitleTest PRIVATE user32 gdi32)
+  add_test(NAME DarkModeToolbarTitleTest COMMAND DarkModeToolbarTitleTest "${DARKMODE_QT_TEST_DIR}")
+  set_tests_properties(DarkModeToolbarTitleTest PROPERTIES SKIP_RETURN_CODE 77)
+endif()

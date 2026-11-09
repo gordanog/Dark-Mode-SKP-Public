@@ -1,21 +1,15 @@
-# Generated artifacts
-*.dll
-*.exe
-*.pdb
-*.obj
-*.lib
-*.exp
-*.ilk
-*.idb
-*.tlog
-*.lastbuildstate
-*.rbz
-*.zip
+# Native build outputs
+DarkModeRuntimeDLL/staged/
+DarkModeRuntimeDLL/build/
+DarkModeRuntimeDLL/out/
+DarkModeRuntimeDLL/cmake-build-*/
+DarkModeSKP/main.dll
+DarkModeSKP/DarkModeSKP/main.dll
+DarkModeSKP/DarkModeSKP/*-status.txt
+DarkModeSKP/DarkModeSKP/*-inventory.txt
 
-# Build caches
-.vscode/
+# CMake and Visual Studio
 .vs/
-.idea/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
@@ -25,8 +19,40 @@
 build/
 out/
 cmake-build-*/
+*.dll
+*.exe
+*.rbz
+*.zip
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
 
-# Local editor and operating-system files
+# Reverse-engineering workspaces and generated data
+.ghidra/
+*.gpr
+*.rep/
+*.dmp
+*.dump
+*.mdmp
+*.bin
+*.log
+*.bmp
+artifacts/
+captures/
+dumps/
+decompiler-output/
+
+# Local reverse-engineering utilities are not part of the public source release
+DarkModeRuntimeDLL/tools/
+
+# Editor and operating-system files
+.vscode/
+.idea/
 *.user
 *.suo
 .DS_Store

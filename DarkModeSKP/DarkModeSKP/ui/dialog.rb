@@ -14,6 +14,7 @@ module Dialog
     restart_required = state.fetch(:restart_required, dark_mode_enabled != dark_mode_applied)
     restart_required = restart_required == true || restart_required.to_s == 'true'
     apply_dark_style = settings.fetch(:apply_dark_style, true) == true || settings.fetch(:apply_dark_style, true).to_s == 'true'
+    auto_check_updates = settings.fetch(:auto_check_updates, true) == true || settings.fetch(:auto_check_updates, true).to_s == 'true'
     body_class = environment_supported && dark_mode_applied ? 'dark-mode' : ''
     status_class = if !environment_supported
       'is-unsupported'
@@ -494,6 +495,21 @@ module Dialog
                 </div>
               </div>
             </div>
+            <div class="input-group">
+              <div style="display: flex; align-items: center; flex: 1; justify-content: space-between;">
+                <label for="autoCheckUpdates">Auto Check For Updates</label>
+                <div style="display: flex; align-items: center;">
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="autoCheckUpdates" #{auto_check_updates ? 'checked' : ''} #{toggle_disabled} onchange="updateSetting('auto_check_updates', this.checked)">
+                    <span class="toggle-slider"></span>
+                  </label>
+                  <div class="info-icon" style="margin-left: 8px;">
+                    ?
+                    <div class="info-tooltip">Checks for a newer release when SketchUp starts and shows a notification if an update is available. Updates are not installed automatically.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="section">
@@ -568,6 +584,11 @@ module Dialog
             if (darkStyleToggle) {
               darkStyleToggle.checked = !!settings.apply_dark_style;
               darkStyleToggle.disabled = !environmentSupported;
+            }
+            var autoUpdatesToggle = document.getElementById('autoCheckUpdates');
+            if (autoUpdatesToggle) {
+              autoUpdatesToggle.checked = settings.auto_check_updates !== false;
+              autoUpdatesToggle.disabled = !environmentSupported;
             }
           }
 

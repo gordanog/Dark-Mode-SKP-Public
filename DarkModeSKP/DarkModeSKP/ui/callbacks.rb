@@ -56,7 +56,7 @@ module DarkModeSKP
     out = {}
     parsed.each do |key, value|
       symbol_key = key.to_sym
-      next unless [:apply_dark_style].include?(symbol_key)
+      next unless [:apply_dark_style, :auto_check_updates].include?(symbol_key)
 
       out[symbol_key] = truthy?(value)
     end

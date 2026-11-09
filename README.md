@@ -1,11 +1,8 @@
-
 # DarkModeSKP
 
 DarkModeSKP is a Windows extension for SketchUp that applies a dark theme to Qt and native Windows interface elements. It combines a Ruby extension with a native C++ helper.
 
-<img width="1906" height="1073" alt="Screenshot 2026-11-07 121147" src="https://github.com/user-attachments/assets/fb002f7c-55cb-4e25-b7b5-09ca20ebbd81" />
-
-*The navigation cube in the top-right corner is the [Viewport Advanced SKP](https://extensions.sketchup.com/extension/cd54da6d-9823-4ac7-9135-974f8988d6a9) extension.*
+<img width="1906" height="1073" alt="image" src="https://github.com/user-attachments/assets/6eb45ec4-a9aa-49de-a8ab-64a1644cbe3f" />
 
 ## Repository layout
 
@@ -67,6 +64,18 @@ The resulting `DarkModeSKP.rbz` must contain `DarkModeSKP.rb` and the `DarkModeS
 
 On unsupported platforms or SketchUp versions, the settings dialog displays the compatibility requirement and disables its toggles.
 
+## Update Checks
+
+The **Auto Check For Updates** toggle in Global Settings is enabled by default. When enabled, the extension checks for a newer stable release asynchronously once at startup, using the public [Dark Mode SKP releases](https://github.com/gordanog/Dark-Mode-SKP-Public/releases). No GitHub login or token is required.
+
+When a newer release is detected, the extension shows a native SketchUp notification with its icon and a Close action, using the same notification pattern as Auto Backup SKP. The message states that Dark Mode SKP is out of date and identifies the available version. Up-to-date results, network failures, and 15-second timeouts remain silent. There is no manual update button, repository link, or update-status text in the settings dialog.
+
+Disabling the setting prevents the next startup check and suppresses any notification from a check already in progress. Existing settings files inherit the enabled default until the user opts out.
+
+Release tags use `vMAJOR.MINOR.PATCH`. Drafts and prereleases are not offered. The checker does not download or install files, and it does not change the running native DLL.
+
 ## Development notes
 
 The native integration relies on version-specific SketchUp internals. Validate behavior against each supported SketchUp release before distributing a build.
+
+Run the update-checker tests with `ruby tests/test_update_checker.rb`. They use SketchUp API stubs and do not load the native DLL or access user settings. The generated-dialog JavaScript tests also need Node.js on PATH, or an executable specified through `DARKMODE_TEST_NODE`; those JavaScript checks are skipped when no runtime is available.

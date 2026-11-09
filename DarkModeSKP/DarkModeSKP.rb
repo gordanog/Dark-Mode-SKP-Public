@@ -10,7 +10,7 @@ module AG
     unless file_loaded?(__FILE__)
       EXTENSION = SketchupExtension.new('Dark Mode SKP', 'DarkModeSKP/main')
 
-      EXTENSION.version     = '0.2.0'
+      EXTENSION.version     = '0.3'
       EXTENSION.creator     = 'gordanog'
       EXTENSION.description = 'Applies a dark theme to SketchUp Qt and native Windows UI in SketchUp 2024 or newer for Windows.'
 

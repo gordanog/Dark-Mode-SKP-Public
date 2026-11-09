@@ -9,7 +9,8 @@ module GlobalSettings
 
   GLOBAL_KEYS = [
     :dark_mode_enabled,
-    :apply_dark_style
+    :apply_dark_style,
+    :auto_check_updates
   ].freeze
 
   def self.settings_path

@@ -16,6 +16,7 @@ module DarkModeSKP
   require_component('DarkModeSKP/global_settings', 'global_settings')
   require_component('DarkModeSKP/core/runtime_bridge', 'core/runtime_bridge')
   require_component('DarkModeSKP/core/style_manager', 'core/style_manager')
+  require_component('DarkModeSKP/core/update_checker', 'core/update_checker')
   require_component('DarkModeSKP/ui/dialog', 'ui/dialog')
   require_component('DarkModeSKP/ui/callbacks', 'ui/callbacks')
 
@@ -75,6 +76,9 @@ module DarkModeSKP
 
     if settings.key?(:apply_dark_style)
       @settings[:apply_dark_style] = truthy?(settings[:apply_dark_style])
+    end
+    if settings.key?(:auto_check_updates)
+      @settings[:auto_check_updates] = truthy?(settings[:auto_check_updates])
     end
 
     persist_settings
@@ -260,6 +264,40 @@ module DarkModeSKP
     }
   end
 
+  def self.check_for_updates
+    return unless truthy?(@settings[:auto_check_updates])
+
+    UpdateChecker.check do
+      next unless truthy?(@settings[:auto_check_updates])
+
+      update = UpdateChecker.state
+      show_update_notification(update[:latest_version]) if update[:status] == 'available'
+    end
+  end
+
+  def self.extension_for_notification
+    return EXTENSION if defined?(EXTENSION) && EXTENSION
+
+    Sketchup.extensions.find { |extension| extension.name == PLUGIN_NAME }
+  rescue
+    nil
+  end
+
+  def self.show_update_notification(latest_version)
+    extension = extension_for_notification
+    return unless extension
+
+    message = "#{PLUGIN_NAME} is out of date. Version #{latest_version} is available."
+    icon_path = logo_icon_path
+    @update_notification = if icon_path
+      UI::Notification.new(extension, message, icon_path, PLUGIN_NAME)
+    else
+      UI::Notification.new(extension, message)
+    end
+    @update_notification.on_accept('Close') { }
+    @update_notification.show
+  end
+
   def self.refresh_dialog_state
     execute_dialog_function('refreshDialogState', dialog_state)
   end
@@ -325,6 +363,7 @@ module DarkModeSKP
     end
     build_menu
     apply_startup_settings
+    UI.start_timer(1.0, false) { check_for_updates } if truthy?(@settings[:auto_check_updates])
     file_loaded(__FILE__)
   end
 
