@@ -50,6 +50,10 @@ decompiler-output/
 # Local reverse-engineering utilities are not part of the public source release
 DarkModeRuntimeDLL/tools/
 
+# Local regression tests are not part of the public source release
+/tests/
+/DarkModeRuntimeDLL/tests/
+
 # Editor and operating-system files
 .vscode/
 .idea/

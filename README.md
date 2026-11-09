@@ -77,5 +77,3 @@ Release tags use `vMAJOR.MINOR.PATCH`. Drafts and prereleases are not offered. T
 ## Development notes
 
 The native integration relies on version-specific SketchUp internals. Validate behavior against each supported SketchUp release before distributing a build.
-
-Run the update-checker tests with `ruby tests/test_update_checker.rb`. They use SketchUp API stubs and do not load the native DLL or access user settings. The generated-dialog JavaScript tests also need Node.js on PATH, or an executable specified through `DARKMODE_TEST_NODE`; those JavaScript checks are skipped when no runtime is available.

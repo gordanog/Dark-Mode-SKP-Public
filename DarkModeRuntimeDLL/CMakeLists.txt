@@ -44,13 +44,3 @@ if(DARKMODE_DEPLOY_PLUGIN_RUNTIME)
     COMMENT "Copying main.dll into the Dark Mode SKP extension"
   )
 endif()
-
-option(DARKMODE_BUILD_TOOLBAR_TITLE_TEST "Build the installed-Qt toolbar title rendering test" OFF)
-set(DARKMODE_QT_TEST_DIR "" CACHE PATH "Directory containing SketchUp's Qt6 DLLs")
-if(DARKMODE_BUILD_TOOLBAR_TITLE_TEST)
-  include(CTest)
-  add_executable(DarkModeToolbarTitleTest tests/test_floating_toolbar_title.cpp)
-  target_link_libraries(DarkModeToolbarTitleTest PRIVATE user32 gdi32)
-  add_test(NAME DarkModeToolbarTitleTest COMMAND DarkModeToolbarTitleTest "${DARKMODE_QT_TEST_DIR}")
-  set_tests_properties(DarkModeToolbarTitleTest PROPERTIES SKIP_RETURN_CODE 77)
-endif()
