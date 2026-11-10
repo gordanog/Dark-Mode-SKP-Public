@@ -6,6 +6,7 @@
 #include <tlhelp32.h>
 #include <richedit.h>
 #include <intrin.h>
+#include <capstone/capstone.h>
 
 #include <algorithm>
 #include <atomic>
@@ -133,16 +134,13 @@ std::vector<ContentBrowserTextDrawHook> g_content_browser_qimage_fill_color_hook
 std::vector<ContentBrowserTextDrawHook> g_content_browser_folder_color_hooks;
 std::vector<ContentBrowserTextDrawHook> g_content_browser_folder_outline_hooks;
 const unsigned char* g_content_browser_folder_color_image_base = nullptr;
-constexpr struct {
+struct ContentBrowserFolderColor {
   size_t return_rva;
   int native_shade;
   int dark_shade;
   size_t outline_return_rva;
-} k_content_browser_folder_colors[] = {
-  {0x3e7492, 230, 36, 0x3e74d1},
-  {0x3e7540, 240, 40, 0x3e757f},
-  {0x3e75ed, 255, 43, 0x3e762c}
 };
+std::vector<ContentBrowserFolderColor> g_content_browser_folder_colors;
 QtColorRgbCtorFn g_content_browser_qcolor_rgb_ctor_proc = nullptr;
 QtColorRgbFn g_content_browser_qcolor_rgb_proc = nullptr;
 QtImageDefaultCtorFn g_content_browser_qimage_default_ctor_proc = nullptr;
@@ -1661,9 +1659,15 @@ const unsigned char* rip_relative_target(const unsigned char* instruction, size_
   return reinterpret_cast<const unsigned char*>(next_instruction + displacement);
 }
 
+const void* resolve_native_function_body(const void* function);
+
 std::vector<void**> find_function_indirect_call_slots(void* function_proc, const std::vector<void*>& target_procs) {
   std::vector<void**> slots;
   if (!function_proc || target_procs.empty()) {
+    return slots;
+  }
+  function_proc = const_cast<void*>(resolve_native_function_body(function_proc));
+  if (!function_proc) {
     return slots;
   }
 
@@ -1872,16 +1876,16 @@ std::string qt_string_return_to_utf8(const QtLookup& lookup, FARPROC string_retu
     return "";
   }
 
-  using QtStringReturnFn = void(__cdecl*)(void*, const void*);
-  using QtStringToUtf8Fn = void(__cdecl*)(void*, const void*);
+  using QtStringReturnFn = void*(__cdecl*)(const void*, void*);
+  using QtStringToUtf8Fn = void*(__cdecl*)(const void*, void*);
   using QtByteArrayConstDataFn = const char*(__cdecl*)(const void*);
   using QtByteArraySizeFn = long long(__cdecl*)(const void*);
   using QtDestructorFn = void(__cdecl*)(void*);
 
   alignas(16) unsigned char qstring_storage[64] = {};
   alignas(16) unsigned char bytearray_storage[64] = {};
-  reinterpret_cast<QtStringReturnFn>(string_return_proc)(qstring_storage, object);
-  reinterpret_cast<QtStringToUtf8Fn>(lookup.qstring_to_utf8_proc)(bytearray_storage, qstring_storage);
+  reinterpret_cast<QtStringReturnFn>(string_return_proc)(object, qstring_storage);
+  reinterpret_cast<QtStringToUtf8Fn>(lookup.qstring_to_utf8_proc)(qstring_storage, bytearray_storage);
 
   std::string result;
   const long long size = reinterpret_cast<QtByteArraySizeFn>(lookup.qbytearray_size_proc)(bytearray_storage);
@@ -1901,13 +1905,13 @@ std::string qstring_to_utf8(const QtLookup& lookup, const void* string) {
     return "";
   }
 
-  using QtStringToUtf8Fn = void(__cdecl*)(void*, const void*);
+  using QtStringToUtf8Fn = void*(__cdecl*)(const void*, void*);
   using QtByteArrayConstDataFn = const char*(__cdecl*)(const void*);
   using QtByteArraySizeFn = long long(__cdecl*)(const void*);
   using QtDestructorFn = void(__cdecl*)(void*);
 
   alignas(16) unsigned char bytearray_storage[64] = {};
-  reinterpret_cast<QtStringToUtf8Fn>(lookup.qstring_to_utf8_proc)(bytearray_storage, string);
+  reinterpret_cast<QtStringToUtf8Fn>(lookup.qstring_to_utf8_proc)(string, bytearray_storage);
 
   std::string result;
   const long long size = reinterpret_cast<QtByteArraySizeFn>(lookup.qbytearray_size_proc)(bytearray_storage);
@@ -2616,7 +2620,8 @@ size_t apply_windows_dark_mode(bool enabled) {
     flush_menu_themes();
   }
 
-  const std::vector<HWND> hwnds = process_windows_including_descendants();
+  std::vector<HWND> hwnds = process_windows_including_descendants();
+  add_unique_hwnd(hwnds, g_about_sketchup_window);
   const BOOL dark_bool = enabled ? TRUE : FALSE;
   size_t changed = 0;
   for (HWND hwnd : hwnds) {
@@ -2648,6 +2653,12 @@ size_t apply_windows_dark_mode(bool enabled) {
       RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
       if (GetParent(hwnd) == nullptr) {
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+      }
+      if (hwnd == g_about_sketchup_window && dwm_set_window_attribute) {
+        HRESULT result = dwm_set_window_attribute(hwnd, 20, &dark_bool, sizeof(dark_bool));
+        if (FAILED(result)) {
+          dwm_set_window_attribute(hwnd, 19, &dark_bool, sizeof(dark_bool));
+        }
       }
     }
   }
@@ -2771,11 +2782,12 @@ bool apply_omnibar_dialog_stylesheet(const QtLookup& lookup, void* widget, bool 
   return true;
 }
 
+const void* omnibar_dialog_vtable();
+
 bool apply_omnibar_dialog_style(const QtLookup& lookup, void* dialog, bool dark) {
-  constexpr size_t omnibar_dialog_vtable_rva = 0x1c61d58;
-  const auto* executable = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
-  if (!executable || !pointer_looks_like_cpp_object(dialog) ||
-      *reinterpret_cast<const void* const*>(dialog) != executable + omnibar_dialog_vtable_rva) {
+  const void* expected = omnibar_dialog_vtable();
+  if (!expected || !pointer_looks_like_cpp_object(dialog) ||
+      *reinterpret_cast<const void* const*>(dialog) != expected) {
     return false;
   }
   return apply_omnibar_dialog_stylesheet(lookup, dialog, dark);
@@ -2912,11 +2924,43 @@ struct PaletteRoleColor {
   int blue = 0;
 };
 
+unsigned int qt_runtime_version() {
+  static const unsigned int version = []() {
+    HMODULE core = GetModuleHandleW(L"Qt6Core.dll");
+    if (!core) {
+      core = GetModuleHandleW(L"Qt5Core.dll");
+    }
+    FARPROC query = core ? GetProcAddress(core, "qVersion") : nullptr;
+    if (!query && core) {
+      query = GetProcAddress(core, "?qVersion@@YAPEBDXZ");
+    }
+    unsigned int major = 0;
+    unsigned int minor = 0;
+    unsigned int patch = 0;
+    const char* text = query ? reinterpret_cast<const char*(__cdecl*)()>(query)() : nullptr;
+    if (!text || sscanf_s(text, "%u.%u.%u", &major, &minor, &patch) != 3 ||
+        major > 255 || minor > 255 || patch > 255) {
+      return 0u;
+    }
+    return (major << 16) | (minor << 8) | patch;
+  }();
+  return version;
+}
+
+bool qt_palette_role_supported(int role, unsigned int version) {
+  const unsigned int major = version >> 16;
+  const unsigned int minor = (version >> 8) & 255;
+  const int count = major == 6 && minor >= 6 ? 22 :
+    major == 6 || (major == 5 && minor >= 12) ? 21 : 20;
+  return role >= 0 && role < count;
+}
+
 bool set_qpalette_color_group_role_color(const QtLookup& lookup,
                                          void* palette,
                                          int color_group,
                                          const PaletteRoleColor& role_color) {
-  if (!palette || !lookup.qcolor_rgb_ctor_proc || !lookup.qpalette_set_color_group_proc) {
+  if (!palette || !lookup.qcolor_rgb_ctor_proc || !lookup.qpalette_set_color_group_proc ||
+      !qt_palette_role_supported(role_color.role, qt_runtime_version())) {
     return false;
   }
 
@@ -2936,7 +2980,8 @@ bool set_qpalette_color_group_role_color(const QtLookup& lookup,
 }
 
 bool set_qpalette_role_color(const QtLookup& lookup, void* palette, const PaletteRoleColor& role_color) {
-  if (!palette || !lookup.qcolor_rgb_ctor_proc || (!lookup.qpalette_set_color_group_proc && !lookup.qpalette_set_color_role_proc)) {
+  if (!palette || !lookup.qcolor_rgb_ctor_proc || (!lookup.qpalette_set_color_group_proc && !lookup.qpalette_set_color_role_proc) ||
+      !qt_palette_role_supported(role_color.role, qt_runtime_version())) {
     return false;
   }
 
@@ -3360,6 +3405,9 @@ bool install_about_sketchup_window_hook() {
 size_t apply_scene_tab_search_dialog_palette(void* dialog);
 
 bool install_non_customizable_toolbar_title_hook(const QtLookup& lookup, void* widget);
+bool is_sketchup_toolbar(const QtLookup& lookup, const void* widget);
+bool install_style_control_hook(const QtLookup& lookup, const void* widget);
+void remove_unused_style_control_hooks();
 
 void CALLBACK qmenu_window_event(
   HWINEVENTHOOK,
@@ -3382,7 +3430,7 @@ void CALLBACK qmenu_window_event(
     return;
   }
 
-  if (qt_object_inherits(lookup, widget, "NonCustomizableToolbar")) {
+  if (is_sketchup_toolbar(lookup, widget)) {
     if (install_non_customizable_toolbar_title_hook(lookup, widget) && lookup.widget_update_proc) {
       reinterpret_cast<void(__cdecl*)(void*)>(lookup.widget_update_proc)(widget);
     }
@@ -4619,13 +4667,19 @@ struct ImageReadSection {
   size_t size = 0;
 };
 
-std::vector<const void*> find_vtables_for_type(const char* type_name) {
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_rtti_discovery_count = 0;
+#endif
+
+std::vector<const void*> find_vtables_for_type(const char* type_name, HMODULE executable = GetModuleHandleW(nullptr)) {
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_rtti_discovery_count;
+#endif
   std::vector<const void*> vtables;
   if (!type_name || type_name[0] == '\0') {
     return vtables;
   }
 
-  HMODULE executable = GetModuleHandleW(nullptr);
   if (!executable) {
     return vtables;
   }
@@ -4699,6 +4753,46 @@ std::vector<const void*> find_vtables_for_type(const char* type_name) {
   }
 
   return vtables;
+}
+
+const void* primary_rtti_vtable(const std::vector<const void*>& vtables) {
+  const void* result = nullptr;
+  for (const void* vtable : vtables) {
+    const auto* slots = static_cast<const void* const*>(vtable);
+    if (!memory_readable(slots - 1, sizeof(void*))) {
+      continue;
+    }
+    const auto* locator = static_cast<const unsigned char*>(slots[-1]);
+    if (memory_readable(locator, 24) && read_unaligned_u32(locator) == 1 &&
+        read_unaligned_u32(locator + 4) == 0) {
+      if (result && result != vtable) {
+        return nullptr;
+      }
+      result = vtable;
+    }
+  }
+  return result;
+}
+
+const void* omnibar_dialog_vtable() {
+  static const void* vtable = primary_rtti_vtable(find_vtables_for_type(".?AVOmnibarDialog@@"));
+  return vtable;
+}
+
+const void* scene_tab_search_dialog_vtable() {
+  static const void* vtable = primary_rtti_vtable(find_vtables_for_type(".?AVSearchSceneTabDlg@@"));
+  return vtable;
+}
+
+const std::vector<const void*>& page_tabs_vtables() {
+  static const auto vtables = find_vtables_for_type(".?AVCPageTabs@@");
+  return vtables;
+}
+
+void prepare_dialog_show_types() {
+  static_cast<void>(omnibar_dialog_vtable());
+  static_cast<void>(scene_tab_search_dialog_vtable());
+  static_cast<void>(page_tabs_vtables());
 }
 
 std::vector<const void*> find_vcb_edit_vtables() {
@@ -4810,6 +4904,7 @@ static_assert(offsetof(Qt6DockTitleOptionView, text) == 64);
 static_assert(sizeof(Qt6DockTitleOptionView) == 96);
 
 ToolbarTitlePaintApi g_toolbar_title_api;
+FARPROC g_dock_title_option_copy = nullptr;
 std::vector<VcbStatusPaintHook> g_toolbar_title_hooks;
 struct ToolbarTitleCloseButton {
   const void* toolbar;
@@ -5137,6 +5232,69 @@ bool draw_non_customizable_toolbar_title(const QtLookup& lookup, const void* sty
   return true;
 }
 
+bool is_sketchup_toolbar(const QtLookup& lookup, const void* widget) {
+  return qt_object_inherits(lookup, widget, "NonCustomizableToolbar") ||
+    qt_object_inherits(lookup, widget, "BaseCustomizableToolbar") ||
+    qt_object_inherits(lookup, widget, "CustomizableToolbar") ||
+    qt_object_inherits(lookup, widget, "qtapputils::ToolBar");
+}
+
+bool draw_legacy_toolbar_title(const QtLookup& lookup, const void* style, const void* option,
+                              void* painter, const void* widget, ToolbarTitleDrawFn original_proc) {
+  if (!style || !painter || !original_proc || !memory_readable(option, sizeof(Qt6DockTitleOptionView)) ||
+      !resolve_toolbar_title_paint_api(lookup)) {
+    return false;
+  }
+  const auto* source = static_cast<const Qt6DockTitleOptionView*>(option);
+  if (source->type != 9 || source->version != 1 || source->vertical_title ||
+      source->rect[2] < source->rect[0] || source->rect[3] < source->rect[1]) {
+    return false;
+  }
+  if (!g_dock_title_option_copy) {
+    g_dock_title_option_copy = GetProcAddress(GetModuleHandleW(L"Qt6Widgets.dll"),
+      "??0QStyleOptionDockWidget@@QEAA@AEBV0@@Z");
+  }
+  if (!g_dock_title_option_copy) {
+    return false;
+  }
+  alignas(16) unsigned char storage[256] = {};
+  auto* dock = reinterpret_cast<Qt6DockTitleOptionView*>(storage);
+  reinterpret_cast<void(__cdecl*)(void*, const void*)>(g_dock_title_option_copy)(dock, source);
+  apply_blender_palette_roles(lookup, dock->palette);
+  alignas(16) unsigned char color[64] = {};
+  reinterpret_cast<QtColorRgbCtorFn>(lookup.qcolor_rgb_ctor_proc)(color, 43, 43, 43, 255);
+  int background_rect[4];
+  std::memcpy(background_rect, dock->rect, sizeof(background_rect));
+  void* close_button = widget ? qwidget_child_at(lookup, const_cast<void*>(widget), dock->rect[2] + 2,
+    dock->rect[1] + (dock->rect[3] - dock->rect[1]) / 2) : nullptr;
+  if (close_button && qt_object_inherits(lookup, close_button, "QToolButton") &&
+      qwidget_parent_widget(lookup, close_button) == widget && is_sketchup_toolbar(lookup, widget)) {
+    const auto* geometry = reinterpret_cast<const int*(__cdecl*)(const void*)>(g_toolbar_title_api.widget_geometry)(close_button);
+    const int width = geometry[2] - geometry[0] + 1;
+    if (width > 0 && width <= 128) {
+      background_rect[2] += width;
+      auto tracked = std::find_if(g_toolbar_title_close_buttons.begin(), g_toolbar_title_close_buttons.end(),
+        [widget](const ToolbarTitleCloseButton& entry) { return entry.toolbar == widget; });
+      if (tracked == g_toolbar_title_close_buttons.end()) {
+        g_toolbar_title_close_buttons.push_back({widget, close_button, {}});
+        tracked = g_toolbar_title_close_buttons.end() - 1;
+      }
+      tracked->button = close_button;
+      std::memcpy(tracked->title_rect, background_rect, sizeof(background_rect));
+      install_non_customizable_toolbar_title_hook(lookup, close_button);
+    }
+  }
+  reinterpret_cast<void(__cdecl*)(void*)>(lookup.qpainter_save_proc)(painter);
+  reinterpret_cast<void(__cdecl*)(void*, const void*, int)>(g_toolbar_title_api.clip_rect)(painter, background_rect, 2);
+  reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(painter, background_rect, color);
+  reinterpret_cast<void(__cdecl*)(void*, const void*, int)>(g_toolbar_title_api.clip_rect)(painter, dock->rect, 2);
+  original_proc(style, 30, dock, painter, widget);
+  reinterpret_cast<void(__cdecl*)(void*)>(lookup.qpainter_restore_proc)(painter);
+  reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.dock_option_destructor)(dock);
+  InterlockedIncrement(&g_toolbar_title_draw_count);
+  return true;
+}
+
 void __cdecl non_customizable_toolbar_title_hook(const void* style, int control, const void* option,
                                                 void* painter, const void* widget) {
   void** slot = &(*reinterpret_cast<void***>(const_cast<void*>(style)))[24];
@@ -5152,7 +5310,7 @@ void __cdecl non_customizable_toolbar_title_hook(const void* style, int control,
         }
         const QtLookup& lookup = resolve_qt_lookup();
         void* toolbar = qwidget_parent_widget(lookup, const_cast<void*>(widget));
-        if (toolbar == entry.toolbar && qt_object_inherits(lookup, toolbar, "NonCustomizableToolbar") &&
+        if (toolbar == entry.toolbar && is_sketchup_toolbar(lookup, toolbar) &&
             reinterpret_cast<bool(__cdecl*)(const void*)>(lookup.widget_is_window_proc)(toolbar) &&
             qwidget_child_at(lookup, toolbar, entry.title_rect[2] - 2,
               entry.title_rect[1] + (entry.title_rect[3] - entry.title_rect[1]) / 2) == widget &&
@@ -5178,6 +5336,13 @@ void __cdecl non_customizable_toolbar_title_hook(const void* style, int control,
 bool install_non_customizable_toolbar_title_hook(const QtLookup& lookup, void* widget) {
   if (!resolve_toolbar_title_paint_api(lookup)) {
     return false;
+  }
+  if (is_sketchup_toolbar(lookup, widget) && !qt_object_inherits(lookup, widget, "NonCustomizableToolbar")) {
+    if (!install_style_control_hook(lookup, widget)) {
+      return false;
+    }
+    g_toolbar_title_dark = true;
+    return true;
   }
   void* style = qwidget_style(lookup, widget);
   if (!pointer_looks_like_cpp_object(style)) {
@@ -5213,6 +5378,7 @@ bool install_non_customizable_toolbar_title_hook(const QtLookup& lookup, void* w
 
 void remove_non_customizable_toolbar_title_hooks() {
   g_toolbar_title_dark = false;
+  remove_unused_style_control_hooks();
   g_toolbar_title_close_buttons.clear();
   for (auto hook = g_toolbar_title_hooks.begin(); hook != g_toolbar_title_hooks.end();) {
     DWORD protection = 0;
@@ -5243,7 +5409,7 @@ bool apply_non_customizable_toolbar_flat_border_style_to_widget(const QtLookup& 
   using QtStringDestructorFn = void(__cdecl*)(void*);
 
   const char* stylesheet = dark
-    ? "NonCustomizableToolbar { background-color: #2b2b2b; border: 1px solid #3a3a3a; }"
+    ? "NonCustomizableToolbar, BaseCustomizableToolbar, CustomizableToolbar, qtapputils--ToolBar { background-color: #2b2b2b; border: 1px solid #3a3a3a; }"
     : "";
   alignas(16) unsigned char qstring_storage[256] = {};
   bool qstring_constructed = false;
@@ -5294,7 +5460,7 @@ NonCustomizableToolbarStyleStats apply_non_customizable_toolbar_flat_border_pale
   static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, 4096));
   for (void* widget : widgets) {
     if (!pointer_looks_like_cpp_object(widget) ||
-        !qt_object_inherits(lookup, widget, "NonCustomizableToolbar")) {
+      !is_sketchup_toolbar(lookup, widget)) {
       continue;
     }
     bool floating = false;
@@ -5712,49 +5878,14 @@ size_t patch_default_environment_svg() {
   return patched_count;
 }
 
-using PanelHeaderRefreshFn = void(__fastcall*)(void*, unsigned char);
-
-bool refresh_panel_header_chevron(PanelHeaderRefreshFn refresh_proc, void* header, unsigned char state) {
-  if (!refresh_proc || !header) {
-    return false;
-  }
-  __try {
-    refresh_proc(header, state);
-    return true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return false;
-  }
-}
+bool refresh_panel_header_chevron(const QtLookup& lookup, void* header);
 
 size_t refresh_tray_chevron_pixmaps(const QtLookup& lookup) {
-  constexpr size_t panel_header_paint_slot = 27;
-  constexpr size_t panel_header_paint_rva = 0x6bcc30;
-  constexpr size_t panel_header_refresh_rva = 0x6bcde0;
-  constexpr size_t panel_header_state_offset = 0x44;
-  constexpr size_t panel_header_helper_offset = 0x50;
-
-  HMODULE executable = GetModuleHandleW(nullptr);
-  const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
-  if (!image_base || !lookup.app_all_widgets_proc) {
+  if (!lookup.app_all_widgets_proc) {
     return 0;
   }
 
-  const void* expected_paint_proc = image_base + panel_header_paint_rva;
-  const PanelHeaderRefreshFn refresh_proc = reinterpret_cast<PanelHeaderRefreshFn>(
-    const_cast<unsigned char*>(image_base + panel_header_refresh_rva));
-  if (!memory_readable(expected_paint_proc, 1) || !memory_readable(reinterpret_cast<const void*>(refresh_proc), 1)) {
-    return 0;
-  }
-
-  std::vector<const void*> panel_header_vtables;
-  for (const void* vtable : find_panel_header_vtables()) {
-    const auto* slots = reinterpret_cast<const void* const*>(vtable);
-    if (!slots || !memory_readable(slots, (panel_header_paint_slot + 1) * sizeof(*slots)) ||
-        slots[panel_header_paint_slot] != expected_paint_proc) {
-      continue;
-    }
-    panel_header_vtables.push_back(vtable);
-  }
+  const auto panel_header_vtables = find_panel_header_vtables();
   if (panel_header_vtables.empty()) {
     return 0;
   }
@@ -5771,17 +5902,7 @@ size_t refresh_tray_chevron_pixmaps(const QtLookup& lookup) {
 
     header_count += 1;
 
-    const auto* header_bytes = reinterpret_cast<const unsigned char*>(widget);
-    if (!memory_readable(header_bytes + panel_header_state_offset, sizeof(unsigned char)) ||
-        !memory_readable(header_bytes + panel_header_helper_offset, sizeof(void*))) {
-      continue;
-    }
-    const unsigned char current_state = *(header_bytes + panel_header_state_offset);
-    if (current_state > 1) {
-      continue;
-    }
-
-    if (refresh_panel_header_chevron(refresh_proc, widget, current_state)) {
+    if (refresh_panel_header_chevron(lookup, widget)) {
       refreshed_count += 1;
     }
   }
@@ -5910,6 +6031,11 @@ bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* so
   if (!source || !result || !resolve_toolbar_title_paint_api(lookup) || !resolve_scene_search_icon_api(lookup)) {
     return false;
   }
+  const auto image_rect = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?rect@QImage@@QEBA?AVQRect@@XZ"));
+  if (!image_rect) {
+    return false;
+  }
   const auto& api = g_scene_search_icon_api;
   alignas(16) unsigned char image[256] = {};
   reinterpret_cast<void*(__cdecl*)(const void*, void*)>(api.pixmap_to_image)(source, image);
@@ -5919,7 +6045,8 @@ bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* so
     alignas(16) unsigned char color[16] = {};
     reinterpret_cast<QtColorRgbCtorFn>(lookup.qcolor_rgb_ctor_proc)(color,
       enabled ? 216 : 112, enabled ? 219 : 112, enabled ? 226 : 112, 255);
-    const int icon_rect[4] = {0, 0, 23, 23};
+    int icon_rect[4] = {};
+    image_rect(image, icon_rect);
     reinterpret_cast<void(__cdecl*)(void*, void*)>(g_toolbar_title_api.painter_ctor)(painter, image);
     reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(painter, 5);
     reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(painter, icon_rect, color);
@@ -5930,22 +6057,88 @@ bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* so
   return valid;
 }
 
-const void* content_browser_search_vtable() {
-  const auto* executable = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
-  return executable ? executable + 0x1c799f8 : nullptr;
+bool refresh_panel_header_chevron(const QtLookup& lookup, void* header) {
+  if (!header || !lookup.object_children_proc || !lookup.object_object_name_proc ||
+      !resolve_toolbar_title_paint_api(lookup) || !resolve_scene_search_icon_api(lookup)) {
+    return false;
+  }
+  const HMODULE widgets_module = GetModuleHandleW(L"Qt6Widgets.dll");
+  const HMODULE gui_module = GetModuleHandleW(L"Qt6Gui.dll");
+  const auto pixmap_get = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(widgets_module, "?pixmap@QLabel@@QEBA?AVQPixmap@@XZ"));
+  const auto pixmap_set = reinterpret_cast<void(__cdecl*)(void*, const void*)>(
+    GetProcAddress(widgets_module, "?setPixmap@QLabel@@QEAAXAEBVQPixmap@@@Z"));
+  const auto image_rect = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(gui_module, "?rect@QImage@@QEBA?AVQRect@@XZ"));
+  if (!pixmap_get || !pixmap_set || !image_rect) {
+    return false;
+  }
+  std::vector<void*> children;
+  std::unordered_set<std::uintptr_t> visited;
+  collect_qwidget_descendants_from_qobject(lookup, header, 0, 2, children, 32, visited, "tray arrow", true);
+  void* arrow = nullptr;
+  for (void* child : children) {
+    if (qwidget_parent_widget(lookup, child) == header && qt_object_inherits(lookup, child, "QLabel") &&
+        qt_string_return_to_utf8(lookup, lookup.object_object_name_proc, child) == "arrow_") {
+      if (arrow) {
+        return false;
+      }
+      arrow = child;
+    }
+  }
+  if (!arrow) {
+    return false;
+  }
+  alignas(16) unsigned char source[256] = {};
+  alignas(16) unsigned char image[256] = {};
+  pixmap_get(arrow, source);
+  reinterpret_cast<void*(__cdecl*)(const void*, void*)>(g_scene_search_icon_api.pixmap_to_image)(source, image);
+  const bool valid = !reinterpret_cast<bool(__cdecl*)(const void*)>(g_toolbar_title_api.image_is_null)(image);
+  if (valid) {
+    alignas(16) unsigned char painter[256] = {};
+    alignas(16) unsigned char color[16] = {};
+    alignas(16) unsigned char tinted[256] = {};
+    int bounds[4] = {};
+    image_rect(image, bounds);
+    reinterpret_cast<QtColorRgbCtorFn>(lookup.qcolor_rgb_ctor_proc)(color, 255, 255, 255, 255);
+    reinterpret_cast<void(__cdecl*)(void*, void*)>(g_toolbar_title_api.painter_ctor)(painter, image);
+    reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(painter, 5);
+    reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(painter, bounds, color);
+    reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.painter_destructor)(painter);
+    reinterpret_cast<void*(__cdecl*)(void*, const void*, unsigned int)>(g_scene_search_icon_api.pixmap_from_image)(tinted, image, 0);
+    pixmap_set(arrow, tinted);
+    reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(tinted);
+  }
+  reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(image);
+  reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(source);
+  return valid;
 }
 
-const void* content_browser_search_pixmap_owner(const void* pixmap, const void* expected_vtable) {
-  const auto address = reinterpret_cast<std::uintptr_t>(pixmap);
-  if (address < 0x10028 || !expected_vtable) {
+const void* content_browser_search_vtable() {
+  static const void* vtable = primary_rtti_vtable(find_vtables_for_type(".?AVContentBrowserSearchBar@@"));
+  return vtable;
+}
+
+const void* content_browser_search_device_owner(const void* device, const void* expected_vtable) {
+  if (!expected_vtable || !memory_readable(device, sizeof(void*))) {
     return nullptr;
   }
-  const auto* owner = reinterpret_cast<const unsigned char*>(address - 0x28);
-  if (!memory_readable(owner, 0x58) || *reinterpret_cast<const void* const*>(owner) != expected_vtable) {
+  const auto* table = *static_cast<const void* const* const*>(device);
+  if (!table || !memory_readable(table - 1, sizeof(void*))) {
     return nullptr;
   }
-  const auto* size = reinterpret_cast<const int*>(owner + 0x40);
-  return size[0] == 24 && size[1] == 24 ? owner : nullptr;
+  const auto* locator = static_cast<const unsigned int*>(table[-1]);
+  if (!memory_readable(locator, 3 * sizeof(unsigned int)) || locator[0] != 1 ||
+      locator[1] == 0 || locator[1] > 4096 || locator[2] != 0) {
+    return nullptr;
+  }
+  const auto address = reinterpret_cast<std::uintptr_t>(device);
+  if (address < 0x10000 + locator[1]) {
+    return nullptr;
+  }
+  const auto* owner = reinterpret_cast<const void*>(address - locator[1]);
+  return memory_readable(owner, sizeof(void*)) && *static_cast<const void* const*>(owner) == expected_vtable
+    ? owner : nullptr;
 }
 
 using ContentBrowserDrawPixmapFn = void(__cdecl*)(void*, const void*, const void*);
@@ -5968,8 +6161,10 @@ bool resolve_content_browser_search_icon_api(const QtLookup& lookup) {
 }
 
 void __cdecl content_browser_search_draw_pixmap_hook(void* painter, const void* rect, const void* pixmap) {
+  const void* device = g_content_browser_search_dark && painter && g_toolbar_title_api.painter_device
+    ? reinterpret_cast<const void*(__cdecl*)(const void*)>(g_toolbar_title_api.painter_device)(painter) : nullptr;
   const void* owner = g_content_browser_search_dark ?
-    content_browser_search_pixmap_owner(pixmap, content_browser_search_vtable()) : nullptr;
+    content_browser_search_device_owner(device, content_browser_search_vtable()) : nullptr;
   if (owner) {
     const bool enabled = reinterpret_cast<bool(__cdecl*)(const void*)>(g_content_browser_widget_enabled)(owner);
     alignas(16) unsigned char tinted[256] = {};
@@ -6160,26 +6355,59 @@ thread_local bool g_scene_search_rendering = false;
 volatile LONG g_scene_search_draw_count = 0;
 
 const void* scene_search_owner_vtable() {
-  const auto* executable = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
-  return executable ? executable + 0x1c96618 : nullptr;
+  static const void* vtable = primary_rtti_vtable(page_tabs_vtables());
+  return vtable;
 }
 
-bool scene_search_owner_matches(const void* owner, const void* button, const void* expected_vtable) {
-  if (!button || !expected_vtable || !memory_readable(owner, 0x30)) {
+bool scene_search_owner_matches(const QtLookup& lookup, const void* owner, const void* button, const void* expected_vtable) {
+  if (!button || !expected_vtable || !memory_readable(owner, sizeof(void*)) ||
+      *static_cast<const void* const*>(owner) != expected_vtable) {
     return false;
   }
-  return *static_cast<const void* const*>(owner) == expected_vtable &&
-    *reinterpret_cast<const void* const*>(static_cast<const unsigned char*>(owner) + 0x28) == button;
+  const void* list = nullptr;
+  if (!try_qobject_children_list(lookup.object_children_proc, owner, &list)) {
+    return false;
+  }
+  const auto children = decode_qt_pointer_list(list);
+  if (!children.items || children.size < 1 || children.size > 64) {
+    return false;
+  }
+  const void* candidate = nullptr;
+  for (long long index = 0; index < children.size; ++index) {
+    void* child = children.items[index];
+    if (qt_object_inherits(lookup, child, "QPushButton") && qwidget_parent_widget(lookup, child) == owner) {
+      if (candidate) {
+        return false;
+      }
+      candidate = child;
+    }
+  }
+  return candidate == button;
 }
 
-bool content_browser_navigation_owner_matches(const void* owner, const void* button, const void* search_vtable) {
-  if (!button || !search_vtable || !memory_readable(owner, 0x150)) {
+bool content_browser_navigation_owner_matches(const QtLookup& lookup, const void* owner, const void* button,
+                                             const void* search_vtable) {
+  if (!search_vtable || !pointer_looks_like_cpp_object(owner) || !qt_object_inherits(lookup, button, "QPushButton") ||
+      qwidget_parent_widget(lookup, const_cast<void*>(button)) != owner ||
+      qt_string_return_to_utf8(lookup, lookup.object_object_name_proc, button) != "nav_menu_") {
     return false;
   }
-  const auto* controls = *reinterpret_cast<const void* const* const*>(
-    static_cast<const unsigned char*>(owner) + 0x148);
-  return memory_readable(controls, 7 * sizeof(void*)) && controls[5] == button &&
-    memory_readable(controls[6], sizeof(void*)) && *static_cast<const void* const*>(controls[6]) == search_vtable;
+  const void* list = nullptr;
+  if (!try_qobject_children_list(lookup.object_children_proc, owner, &list)) {
+    return false;
+  }
+  const auto children = decode_qt_pointer_list(list);
+  if (!children.items || children.size < 1 || children.size > 128) {
+    return false;
+  }
+  size_t search_count = 0;
+  for (long long index = 0; index < children.size; ++index) {
+    const void* child = children.items[index];
+    if (memory_readable(child, sizeof(void*)) && *static_cast<const void* const*>(child) == search_vtable) {
+      ++search_count;
+    }
+  }
+  return search_count == 1;
 }
 
 bool is_content_browser_navigation_button(const QtLookup& lookup, const void* widget) {
@@ -6188,12 +6416,12 @@ bool is_content_browser_navigation_button(const QtLookup& lookup, const void* wi
   }
   void* parent = qwidget_parent_widget(lookup, const_cast<void*>(widget));
   return qt_object_inherits(lookup, parent, "ContentBrowserPage") &&
-    content_browser_navigation_owner_matches(parent, widget, content_browser_search_vtable());
+    content_browser_navigation_owner_matches(lookup, parent, widget, content_browser_search_vtable());
 }
 
 bool is_scene_search_button(const QtLookup& lookup, const void* widget) {
   return pointer_looks_like_cpp_object(widget) && qt_object_inherits(lookup, widget, "QPushButton") &&
-    scene_search_owner_matches(qwidget_parent_widget(lookup, const_cast<void*>(widget)), widget, scene_search_owner_vtable());
+    scene_search_owner_matches(lookup, qwidget_parent_widget(lookup, const_cast<void*>(widget)), widget, scene_search_owner_vtable());
 }
 
 void __cdecl scene_search_label_hook(const void* style, int control, const void* option,
@@ -6205,6 +6433,14 @@ void __cdecl scene_search_label_hook(const void* style, int control, const void*
     return;
   }
   const auto original_proc = reinterpret_cast<ToolbarTitleDrawFn>(hook->original_proc);
+  if (g_toolbar_title_dark && control == 30 && widget) {
+    const QtLookup& lookup = resolve_qt_lookup();
+    if (is_sketchup_toolbar(lookup, widget) && !qt_object_inherits(lookup, widget, "NonCustomizableToolbar") &&
+        reinterpret_cast<bool(__cdecl*)(const void*)>(lookup.widget_is_window_proc)(widget) &&
+        draw_legacy_toolbar_title(lookup, style, option, painter, widget, original_proc)) {
+      return;
+    }
+  }
   if (g_scene_search_dark && !g_scene_search_rendering && control == 0 && widget) {
     const QtLookup& lookup = resolve_qt_lookup();
     const bool scene_search = is_scene_search_button(lookup, widget);
@@ -6223,10 +6459,7 @@ void __cdecl scene_search_label_hook(const void* style, int control, const void*
   original_proc(style, control, option, painter, widget);
 }
 
-bool install_scene_search_label_hook(const QtLookup& lookup, const void* widget) {
-  if (!resolve_toolbar_title_paint_api(lookup) || !install_scene_search_pixmap_hooks(lookup)) {
-    return false;
-  }
+bool install_style_control_hook(const QtLookup& lookup, const void* widget) {
   void* style = qwidget_style(lookup, widget);
   if (!pointer_looks_like_cpp_object(style) || !memory_readable(*static_cast<void***>(style), 23 * sizeof(void*))) {
     return false;
@@ -6234,7 +6467,6 @@ bool install_scene_search_label_hook(const QtLookup& lookup, const void* widget)
   void** slot = *static_cast<void***>(style) + 22;
   for (const VcbStatusPaintHook& hook : g_scene_search_hooks) {
     if (hook.slot == slot) {
-      g_scene_search_dark = true;
       return *slot == reinterpret_cast<void*>(&scene_search_label_hook);
     }
   }
@@ -6251,13 +6483,22 @@ bool install_scene_search_label_hook(const QtLookup& lookup, const void* widget)
   *slot = reinterpret_cast<void*>(&scene_search_label_hook);
   DWORD ignored_protection = 0;
   VirtualProtect(slot, sizeof(void*), previous_protection, &ignored_protection);
+  return true;
+}
+
+bool install_scene_search_label_hook(const QtLookup& lookup, const void* widget) {
+  if (!resolve_toolbar_title_paint_api(lookup) || !install_scene_search_pixmap_hooks(lookup) ||
+      !install_style_control_hook(lookup, widget)) {
+    return false;
+  }
   g_scene_search_dark = true;
   return true;
 }
 
-void remove_scene_search_label_hooks() {
-  g_scene_search_dark = false;
-  remove_scene_search_pixmap_hooks();
+void remove_unused_style_control_hooks() {
+  if (g_scene_search_dark || g_toolbar_title_dark) {
+    return;
+  }
   for (auto hook = g_scene_search_hooks.begin(); hook != g_scene_search_hooks.end();) {
     if (*hook->slot == reinterpret_cast<void*>(&scene_search_label_hook)) {
       DWORD previous_protection = 0;
@@ -6271,6 +6512,12 @@ void remove_scene_search_label_hooks() {
     }
     hook = g_scene_search_hooks.erase(hook);
   }
+}
+
+void remove_scene_search_label_hooks() {
+  g_scene_search_dark = false;
+  remove_scene_search_pixmap_hooks();
+  remove_unused_style_control_hooks();
 }
 
 size_t refresh_content_browser_filter_icons(const QtLookup& lookup) {
@@ -6300,20 +6547,14 @@ size_t refresh_content_browser_filter_icons(const QtLookup& lookup) {
 }
 
 bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget) {
-  constexpr size_t page_tabs_primary_vtable_rva = 0x1c96618;
-  constexpr size_t page_tabs_qwidget_vtable_rva = 0x1c96790;
   if (!lookup.app_all_widgets_proc || !lookup.widget_parent_widget_proc ||
       !lookup.widget_update_proc || !lookup.widget_repaint_proc) {
     return false;
   }
 
-  HMODULE executable = GetModuleHandleW(nullptr);
-  const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
-  const void* expected_primary_vtable = image_base ? image_base + page_tabs_primary_vtable_rva : nullptr;
-  const void* expected_qwidget_vtable = image_base ? image_base + page_tabs_qwidget_vtable_rva : nullptr;
-  if (!expected_primary_vtable || !expected_qwidget_vtable ||
-      !memory_readable(expected_primary_vtable, sizeof(void*)) ||
-      !memory_readable(expected_qwidget_vtable, sizeof(void*))) {
+  const auto& expected_vtables = page_tabs_vtables();
+  const void* expected_primary_vtable = scene_search_owner_vtable();
+  if (!expected_primary_vtable) {
     return false;
   }
 
@@ -6328,7 +6569,7 @@ bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget) {
         return false;
       }
       const void* vtable = *reinterpret_cast<const void* const*>(current);
-      if (vtable == expected_primary_vtable || vtable == expected_qwidget_vtable) {
+      if (std::find(expected_vtables.begin(), expected_vtables.end(), vtable) != expected_vtables.end()) {
         page_tabs = current;
         break;
       }
@@ -6374,7 +6615,7 @@ bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget) {
       continue;
     }
     void* parent = reinterpret_cast<QtParentWidgetFn>(lookup.widget_parent_widget_proc)(widget);
-    if (!scene_search_owner_matches(parent, widget, expected_primary_vtable)) {
+    if (!scene_search_owner_matches(lookup, parent, widget, expected_primary_vtable)) {
       continue;
     }
     if (g_scene_search_dark &&
@@ -6648,18 +6889,13 @@ constexpr char k_tray_hide_icon_resource_alias[] = ":/dlg_tray_dialog_hide";
 
 void __fastcall tray_hide_icon_add_file_hook(void* icon, const void* file_name, const void* size,
                                              int mode, int state) {
-  constexpr size_t tray_hide_icon_builder_return_rva = 0x6bd358;
   QIconAddFileFn original_proc = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_tray_hide_icon_mutex);
     original_proc = g_original_tray_hide_icon_add_file;
   }
 
-  HMODULE executable = GetModuleHandleW(nullptr);
-  const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
-  const bool from_tray_hide_icon_builder = image_base &&
-    _ReturnAddress() == image_base + tray_hide_icon_builder_return_rva;
-  if (original_proc && from_tray_hide_icon_builder && icon_theme_enabled() && !g_tray_hide_icon_patching) {
+  if (original_proc && icon_theme_enabled() && !g_tray_hide_icon_patching) {
     g_tray_hide_icon_patching = true;
     const QtLookup& lookup = resolve_qt_lookup();
     if (qstring_to_utf8(lookup, file_name) == k_tray_hide_icon_resource_alias) {
@@ -6919,6 +7155,10 @@ bool configure_icon_theme(bool enabled) {
 std::vector<void**> find_function_indirect_call_slots(void* function_proc, const std::vector<void**>& target_slots) {
   std::vector<void**> slots;
   if (!function_proc || target_slots.empty()) {
+    return slots;
+  }
+  function_proc = const_cast<void*>(resolve_native_function_body(function_proc));
+  if (!function_proc) {
     return slots;
   }
 
@@ -7358,15 +7598,961 @@ bool resolve_content_browser_folder_outline_api(const QtLookup& lookup) {
     api.pen_color && api.pen_set_color && api.pen_destructor;
 }
 
+struct NativeImageView {
+  const unsigned char* base = nullptr;
+  const IMAGE_NT_HEADERS64* headers = nullptr;
+  size_t size = 0;
+
+  explicit NativeImageView(HMODULE module) {
+    base = reinterpret_cast<const unsigned char*>(module);
+    if (!memory_readable(base, sizeof(IMAGE_DOS_HEADER))) {
+      return;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+      return;
+    }
+    const auto* candidate = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (!memory_readable(candidate, sizeof(*candidate)) || candidate->Signature != IMAGE_NT_SIGNATURE ||
+        candidate->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        candidate->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+      return;
+    }
+    headers = candidate;
+    size = headers->OptionalHeader.SizeOfImage;
+  }
+
+  bool contains(size_t rva, size_t length) const {
+    return headers && rva < size && length <= size - rva && memory_readable(base + rva, length);
+  }
+
+  void** import_slot(const char* name) const {
+    if (!headers) {
+      return nullptr;
+    }
+    const auto directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!contains(directory.VirtualAddress, directory.Size)) {
+      return nullptr;
+    }
+    void** result = nullptr;
+    const auto* descriptors = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress);
+    for (size_t index = 0; index < directory.Size / sizeof(*descriptors) && descriptors[index].Name; ++index) {
+      const auto& descriptor = descriptors[index];
+      if (!descriptor.OriginalFirstThunk || !descriptor.FirstThunk) {
+        continue;
+      }
+      for (size_t offset = 0; contains(descriptor.OriginalFirstThunk + offset, sizeof(IMAGE_THUNK_DATA64));
+           offset += sizeof(IMAGE_THUNK_DATA64)) {
+        const auto thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + descriptor.OriginalFirstThunk + offset)->u1.AddressOfData;
+        if (!thunk) {
+          break;
+        }
+        if (IMAGE_SNAP_BY_ORDINAL64(thunk) || !contains(thunk, sizeof(WORD) + std::strlen(name) + 1)) {
+          continue;
+        }
+        const char* symbol = reinterpret_cast<const char*>(base + thunk + sizeof(WORD));
+        if (std::memcmp(symbol, name, std::strlen(name) + 1) == 0) {
+          if (result || !contains(descriptor.FirstThunk + offset, sizeof(void*))) {
+            return nullptr;
+          }
+          result = reinterpret_cast<void**>(const_cast<unsigned char*>(base) + descriptor.FirstThunk + offset);
+        }
+      }
+    }
+    return result;
+  }
+
+  size_t function_size(const void* function) const {
+    if (!headers || reinterpret_cast<std::uintptr_t>(function) < reinterpret_cast<std::uintptr_t>(base)) {
+      return 0;
+    }
+    const size_t rva = reinterpret_cast<std::uintptr_t>(function) - reinterpret_cast<std::uintptr_t>(base);
+    const auto directory = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!contains(rva, 1) || !contains(directory.VirtualAddress, directory.Size)) {
+      return 0;
+    }
+    const auto* entries = reinterpret_cast<const RUNTIME_FUNCTION*>(base + directory.VirtualAddress);
+    const size_t count = directory.Size / sizeof(*entries);
+    const auto* found = std::lower_bound(entries, entries + count, rva,
+      [](const RUNTIME_FUNCTION& entry, size_t address) { return entry.BeginAddress < address; });
+    if (found == entries + count || found->BeginAddress != rva || found->EndAddress <= rva ||
+        found->EndAddress - rva > 65536 || !contains(rva, found->EndAddress - rva)) {
+      return 0;
+    }
+    return found->EndAddress - rva;
+  }
+
+  const void* function_body(const void* function) const {
+    for (size_t depth = 0; headers && depth < 8; ++depth) {
+      const auto address = reinterpret_cast<std::uintptr_t>(function);
+      const auto image_address = reinterpret_cast<std::uintptr_t>(base);
+      if (address < image_address || !contains(address - image_address, 1)) {
+        return nullptr;
+      }
+      const size_t rva = address - image_address;
+      const auto* sections = IMAGE_FIRST_SECTION(headers);
+      bool executable = false;
+      for (WORD index = 0; index < headers->FileHeader.NumberOfSections; ++index) {
+        const auto& section = sections[index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) && rva >= section.VirtualAddress &&
+            rva - section.VirtualAddress < section.Misc.VirtualSize) {
+          executable = true;
+          break;
+        }
+      }
+      if (!executable) {
+        return nullptr;
+      }
+      if (base[rva] != 0xe9) {
+        return function_size(function) ? function : nullptr;
+      }
+      if (!contains(rva, 5)) {
+        return nullptr;
+      }
+      std::int32_t displacement = 0;
+      std::memcpy(&displacement, base + rva + 1, sizeof(displacement));
+      const auto target = static_cast<std::int64_t>(rva) + 5 + displacement;
+      if (target < 0 || static_cast<std::uint64_t>(target) >= size) {
+        return nullptr;
+      }
+      function = base + target;
+    }
+    return nullptr;
+  }
+};
+
+const void* resolve_native_function_body(const void* function) {
+  HMODULE module = nullptr;
+  if (!function || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+      reinterpret_cast<LPCWSTR>(function), &module)) {
+    return nullptr;
+  }
+  return NativeImageView(module).function_body(function);
+}
+
+int native_register_index(unsigned int reg) {
+  switch (reg) {
+    case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: case X86_REG_AH: return 0;
+    case X86_REG_RCX: case X86_REG_ECX: case X86_REG_CX: case X86_REG_CL: case X86_REG_CH: return 1;
+    case X86_REG_RDX: case X86_REG_EDX: case X86_REG_DX: case X86_REG_DL: case X86_REG_DH: return 2;
+    case X86_REG_RBX: case X86_REG_EBX: case X86_REG_BX: case X86_REG_BL: case X86_REG_BH: return 3;
+    case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP: case X86_REG_SPL: return 4;
+    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP: case X86_REG_BPL: return 5;
+    case X86_REG_RSI: case X86_REG_ESI: case X86_REG_SI: case X86_REG_SIL: return 6;
+    case X86_REG_RDI: case X86_REG_EDI: case X86_REG_DI: case X86_REG_DIL: return 7;
+    case X86_REG_R8: case X86_REG_R8D: case X86_REG_R8W: case X86_REG_R8B: return 8;
+    case X86_REG_R9: case X86_REG_R9D: case X86_REG_R9W: case X86_REG_R9B: return 9;
+    case X86_REG_R10: case X86_REG_R10D: case X86_REG_R10W: case X86_REG_R10B: return 10;
+    case X86_REG_R11: case X86_REG_R11D: case X86_REG_R11W: case X86_REG_R11B: return 11;
+    case X86_REG_R12: case X86_REG_R12D: case X86_REG_R12W: case X86_REG_R12B: return 12;
+    case X86_REG_R13: case X86_REG_R13D: case X86_REG_R13W: case X86_REG_R13B: return 13;
+    case X86_REG_R14: case X86_REG_R14D: case X86_REG_R14W: case X86_REG_R14B: return 14;
+    case X86_REG_R15: case X86_REG_R15D: case X86_REG_R15W: case X86_REG_R15B: return 15;
+    default: return -1;
+  }
+}
+
+struct DiscoveredFolderColor {
+  size_t return_rva = 0;
+  int native_shade = 0;
+  size_t outline_return_rva = 0;
+};
+
+struct NativeFunctionCalls {
+  bool complete = false;
+  std::vector<const void*> direct;
+  std::vector<void**> imports;
+  std::vector<size_t> import_returns;
+};
+
+NativeFunctionCalls decode_native_function_calls(const NativeImageView& image, const void* function, csh decoder) {
+  NativeFunctionCalls result;
+  function = image.function_body(function);
+  const size_t length = image.function_size(function);
+  if (!length) {
+    return result;
+  }
+  cs_insn* instructions = nullptr;
+  const size_t count = cs_disasm(decoder, static_cast<const uint8_t*>(function), length,
+    reinterpret_cast<uint64_t>(function), 0, &instructions);
+  for (size_t index = 0; index < count; ++index) {
+    const auto& instruction = instructions[index];
+    if (instruction.id != X86_INS_CALL || instruction.detail->x86.op_count != 1) {
+      continue;
+    }
+    const auto& target = instruction.detail->x86.operands[0];
+    if (target.type == X86_OP_IMM) {
+      if (const void* body = image.function_body(reinterpret_cast<const void*>(target.imm))) {
+        result.direct.push_back(body);
+      }
+    } else if (target.type == X86_OP_MEM && target.mem.base == X86_REG_RIP &&
+               target.mem.index == X86_REG_INVALID) {
+      const auto address = instruction.address + instruction.size + target.mem.disp;
+      if (address >= reinterpret_cast<uint64_t>(image.base) &&
+          image.contains(address - reinterpret_cast<uint64_t>(image.base), sizeof(void*))) {
+        result.imports.push_back(reinterpret_cast<void**>(address));
+        result.import_returns.push_back(instruction.address + instruction.size - reinterpret_cast<uint64_t>(image.base));
+      }
+    }
+  }
+  result.complete = count && instructions[count - 1].address + instructions[count - 1].size ==
+    reinterpret_cast<uint64_t>(function) + length;
+  cs_free(instructions, count);
+  return result;
+}
+
+struct ContentBrowserImageFunctions {
+  const void* generator = nullptr;
+  const void* renderer = nullptr;
+  void** fill_slot = nullptr;
+  size_t fill_return_rva = 0;
+};
+
+struct TagEyePixmapCall {
+  void** slot = nullptr;
+  size_t return_rva = 0;
+  bool cached = false;
+};
+
+bool create_legacy_about_image(const QtLookup& lookup, const void* source, void* result) {
+  const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  const auto width_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?width@QImage@@QEBAHXZ"));
+  const auto height_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?height@QImage@@QEBAHXZ"));
+  const auto format_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?format@QImage@@QEBA?AW4Format@1@XZ"));
+  const auto pixel_proc = reinterpret_cast<unsigned int(__cdecl*)(const void*, int, int)>(GetProcAddress(gui, "?pixel@QImage@@QEBAIHH@Z"));
+  const auto set_pixel = reinterpret_cast<void(__cdecl*)(void*, int, int, unsigned int)>(GetProcAddress(gui, "?setPixel@QImage@@QEAAXHHI@Z"));
+  const auto copy_proc = reinterpret_cast<void(__cdecl*)(void*, const void*)>(GetProcAddress(gui, "??0QImage@@QEAA@AEBV0@@Z"));
+  if (!source || !result || !width_proc || !height_proc || !format_proc || !pixel_proc || !set_pixel || !copy_proc ||
+      !resolve_toolbar_title_paint_api(lookup)) {
+    return false;
+  }
+  const int width = width_proc(source);
+  const int height = height_proc(source);
+  const int format = format_proc(source);
+  if (width <= 0 || height <= 0 || width > 2048 || height > 2048 ||
+      (format != 4 && format != 5 && format != 6 && format != 13 && format != 29)) {
+    return false;
+  }
+  for (const auto& corner : {std::pair<int, int>{0, 0}, {width - 1, 0}, {0, height - 1}, {width - 1, height - 1}}) {
+    const unsigned int pixel = pixel_proc(source, corner.first, corner.second);
+    const int red = (pixel >> 16) & 255;
+    const int green = (pixel >> 8) & 255;
+    const int blue = pixel & 255;
+    if ((pixel >> 24) != 255 || std::min({red, green, blue}) < 230 ||
+        std::max({red, green, blue}) - std::min({red, green, blue}) > 24) {
+      return false;
+    }
+  }
+  copy_proc(result, source);
+  for (int row = 0; row < height; ++row) {
+    for (int column = 0; column < width; ++column) {
+      const unsigned int pixel = pixel_proc(source, column, row);
+      const int red = (pixel >> 16) & 255;
+      const int green = (pixel >> 8) & 255;
+      const int blue = pixel & 255;
+      const int low = std::min({red, green, blue});
+      const int high = std::max({red, green, blue});
+      if ((pixel >> 24) == 255 && high - low <= 24) {
+        const int shade = 43 + std::max(0, 230 - high) * 173 / 230;
+        set_pixel(result, column, row, 0xff000000u | (shade << 16) | (shade << 8) | shade);
+      }
+    }
+  }
+  return true;
+}
+
+struct AboutImageCall {
+  void** slot = nullptr;
+  size_t return_rva = 0;
+};
+
+AboutImageCall discover_about_image_call(HMODULE module) {
+  const NativeImageView image(module);
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVAboutSketchUp@@", module));
+  void** draw_slot = image.import_slot("?drawImage@QPainter@@QEAAXAEBVQRect@@AEBVQImage@@@Z");
+  if (!draw_slot || !memory_readable(table, 28 * sizeof(void*))) {
+    return {};
+  }
+  csh decoder = 0;
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  const auto calls = decode_native_function_calls(image, static_cast<const void* const*>(table)[27], decoder);
+  cs_close(&decoder);
+  if (!calls.complete || std::count(calls.imports.begin(), calls.imports.end(), draw_slot) != 1) {
+    return {};
+  }
+  const auto index = std::find(calls.imports.begin(), calls.imports.end(), draw_slot) - calls.imports.begin();
+  return {draw_slot, calls.import_returns[index]};
+}
+
+VcbStatusPaintHook g_about_image_hook;
+std::uintptr_t g_about_image_return = 0;
+long long g_about_image_cache_key = 0;
+alignas(16) unsigned char g_about_image_cache[256] = {};
+bool g_about_image_cache_constructed = false;
+
+void clear_about_image_cache() {
+  if (g_about_image_cache_constructed) {
+    reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(g_about_image_cache);
+    g_about_image_cache_constructed = false;
+  }
+  g_about_image_cache_key = 0;
+}
+
+bool draw_legacy_material_image(void* painter, const void* rect, const void* image,
+  std::uintptr_t caller, ContentBrowserDrawPixmapFn original);
+
+void __cdecl about_draw_image_hook(void* painter, const void* rect, const void* image) {
+  const auto original = reinterpret_cast<ContentBrowserDrawPixmapFn>(g_about_image_hook.original_proc);
+  if (!original) {
+    return;
+  }
+  if (draw_legacy_material_image(painter, rect, image, reinterpret_cast<std::uintptr_t>(_ReturnAddress()), original)) {
+    return;
+  }
+  if (g_about_image_return && reinterpret_cast<std::uintptr_t>(_ReturnAddress()) == g_about_image_return) {
+    const auto cache_key = reinterpret_cast<long long(__cdecl*)(const void*)>(
+      GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?cacheKey@QImage@@QEBA_JXZ"));
+    const long long key = cache_key ? cache_key(image) : 0;
+    if (key && key != g_about_image_cache_key) {
+      clear_about_image_cache();
+      g_about_image_cache_constructed = create_legacy_about_image(resolve_qt_lookup(), image, g_about_image_cache);
+      g_about_image_cache_key = key;
+    }
+    if (key && g_about_image_cache_constructed) {
+      original(painter, rect, g_about_image_cache);
+      return;
+    }
+  }
+  original(painter, rect, image);
+}
+
+bool set_about_image_hook(const QtLookup& lookup, bool dark) {
+  if (!dark) {
+    g_about_image_return = 0;
+    clear_about_image_cache();
+    if (!g_about_image_hook.slot) {
+      return true;
+    }
+    DWORD protection = 0;
+    if (!VirtualProtect(g_about_image_hook.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+      return false;
+    }
+    if (*g_about_image_hook.slot == reinterpret_cast<void*>(&about_draw_image_hook)) {
+      *g_about_image_hook.slot = g_about_image_hook.original_proc;
+    }
+    DWORD unused = 0;
+    VirtualProtect(g_about_image_hook.slot, sizeof(void*), protection, &unused);
+    g_about_image_hook = {};
+    return true;
+  }
+  if (g_about_image_hook.slot) {
+    return *g_about_image_hook.slot == reinterpret_cast<void*>(&about_draw_image_hook);
+  }
+  const HMODULE module = GetModuleHandleW(nullptr);
+  const auto call = discover_about_image_call(module);
+  if (!call.slot) {
+    return true;
+  }
+  const auto original = GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"),
+    "?drawImage@QPainter@@QEAAXAEBVQRect@@AEBVQImage@@@Z");
+  if (!original || *call.slot != reinterpret_cast<void*>(original) || !resolve_toolbar_title_paint_api(lookup)) {
+    return false;
+  }
+  DWORD protection = 0;
+  if (!VirtualProtect(call.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  g_about_image_hook = {call.slot, *call.slot};
+  g_about_image_return = reinterpret_cast<std::uintptr_t>(module) + call.return_rva;
+  *call.slot = reinterpret_cast<void*>(&about_draw_image_hook);
+  DWORD unused = 0;
+  VirtualProtect(call.slot, sizeof(void*), protection, &unused);
+  return true;
+}
+
+TagEyePixmapCall discover_tag_eye_pixmap_call(HMODULE module) {
+  const NativeImageView image(module);
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVTagDialogShowHideDelegate@@", module));
+  void** pixmap_slot = image.import_slot("?drawPixmap@QPainter@@QEAAXAEBVQPoint@@AEBVQPixmap@@@Z");
+  if (!memory_readable(table, 12 * sizeof(void*)) || !pixmap_slot) {
+    return {};
+  }
+  csh decoder = 0;
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  const auto calls = decode_native_function_calls(image, static_cast<const void* const*>(table)[11], decoder);
+  cs_close(&decoder);
+  if (!calls.complete || std::count(calls.imports.begin(), calls.imports.end(), pixmap_slot) != 1) {
+    return {};
+  }
+  const auto index = std::find(calls.imports.begin(), calls.imports.end(), pixmap_slot) - calls.imports.begin();
+  void** icon_slot = image.import_slot("?pixmap@QIcon@@QEBA?AVQPixmap@@AEBVQSize@@NW4Mode@1@W4State@1@@Z");
+  return {pixmap_slot, calls.import_returns[index],
+    std::find(calls.imports.begin(), calls.imports.end(), icon_slot) == calls.imports.end()};
+}
+
+VcbStatusPaintHook g_tag_eye_pixmap_hook;
+std::uintptr_t g_tag_eye_pixmap_return = 0;
+
+void __cdecl tag_eye_draw_pixmap_hook(void* painter, const void* point, const void* pixmap) {
+  const auto original = reinterpret_cast<ContentBrowserDrawPixmapFn>(g_tag_eye_pixmap_hook.original_proc);
+  if (!original) {
+    return;
+  }
+  if (g_tag_eye_pixmap_return && reinterpret_cast<std::uintptr_t>(_ReturnAddress()) == g_tag_eye_pixmap_return) {
+    alignas(16) unsigned char tinted[256] = {};
+    if (create_content_browser_search_pixmap(resolve_qt_lookup(), pixmap, tinted, true)) {
+      original(painter, point, tinted);
+      reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(tinted);
+      return;
+    }
+  }
+  original(painter, point, pixmap);
+}
+
+bool set_tag_eye_icon_hook(const QtLookup& lookup, bool dark) {
+  if (!dark) {
+    g_tag_eye_pixmap_return = 0;
+    if (!g_tag_eye_pixmap_hook.slot) {
+      return true;
+    }
+    DWORD protection = 0;
+    if (!VirtualProtect(g_tag_eye_pixmap_hook.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+      return false;
+    }
+    if (*g_tag_eye_pixmap_hook.slot == reinterpret_cast<void*>(&tag_eye_draw_pixmap_hook)) {
+      *g_tag_eye_pixmap_hook.slot = g_tag_eye_pixmap_hook.original_proc;
+    }
+    DWORD unused = 0;
+    VirtualProtect(g_tag_eye_pixmap_hook.slot, sizeof(void*), protection, &unused);
+    g_tag_eye_pixmap_hook = {};
+    return true;
+  }
+  if (g_tag_eye_pixmap_hook.slot) {
+    return *g_tag_eye_pixmap_hook.slot == reinterpret_cast<void*>(&tag_eye_draw_pixmap_hook);
+  }
+  const HMODULE module = GetModuleHandleW(nullptr);
+  const auto call = discover_tag_eye_pixmap_call(module);
+  if (!call.slot) {
+    return false;
+  }
+  if (!call.cached) {
+    return true;
+  }
+  const auto original = GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"),
+    "?drawPixmap@QPainter@@QEAAXAEBVQPoint@@AEBVQPixmap@@@Z");
+  if (!original || *call.slot != reinterpret_cast<void*>(original) ||
+      !resolve_toolbar_title_paint_api(lookup) || !resolve_scene_search_icon_api(lookup)) {
+    return false;
+  }
+  DWORD protection = 0;
+  if (!VirtualProtect(call.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  g_tag_eye_pixmap_hook = {call.slot, *call.slot};
+  g_tag_eye_pixmap_return = reinterpret_cast<std::uintptr_t>(module) + call.return_rva;
+  *call.slot = reinterpret_cast<void*>(&tag_eye_draw_pixmap_hook);
+  DWORD unused = 0;
+  VirtualProtect(call.slot, sizeof(void*), protection, &unused);
+  return true;
+}
+
+ContentBrowserImageFunctions discover_content_browser_image_functions(HMODULE module) {
+  const NativeImageView image(module);
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVContentBrowserListCtrl@@", module));
+  const std::vector<void**> generator_imports = {
+    image.import_slot("??0QImage@@QEAA@XZ"),
+    image.import_slot("??0QImage@@QEAA@AEBV0@@Z"),
+    image.import_slot("?setDevicePixelRatio@QImage@@QEAAXN@Z"),
+    image.import_slot("??0QColor@@QEAA@W4GlobalColor@Qt@@@Z")
+  };
+  const std::vector<void**> renderer_imports = {
+    image.import_slot("?fill@QImage@@QEAAXAEBVQColor@@@Z"),
+    image.import_slot("??0QSvgRenderer@@QEAA@AEBVQString@@PEAVQObject@@@Z"),
+    image.import_slot("?render@QSvgRenderer@@QEAAXPEAVQPainter@@@Z")
+  };
+  if (!memory_readable(table, 28 * sizeof(void*)) ||
+      std::find(generator_imports.begin(), generator_imports.end(), nullptr) != generator_imports.end() ||
+      std::find(renderer_imports.begin(), renderer_imports.end(), nullptr) != renderer_imports.end()) {
+    return {};
+  }
+  csh decoder = 0;
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  auto find_matches = [&image, decoder](const void* root, unsigned int depth_limit,
+                                        const std::vector<void**>& required) {
+    std::vector<const void*> matches;
+    std::vector<std::pair<const void*, unsigned int>> pending = {{root, 0}};
+    std::unordered_set<const void*> visited;
+    for (size_t index = 0; index < pending.size(); ++index) {
+      const auto current = pending[index];
+      if (!visited.insert(current.first).second) {
+        continue;
+      }
+      if (visited.size() > 256) {
+        return std::vector<const void*>{};
+      }
+      const auto calls = decode_native_function_calls(image, current.first, decoder);
+      if (!calls.complete) {
+        return std::vector<const void*>{};
+      }
+      if (std::all_of(required.begin(), required.end(), [&calls](void** slot) {
+            return std::find(calls.imports.begin(), calls.imports.end(), slot) != calls.imports.end();
+          })) {
+        matches.push_back(current.first);
+      }
+      if (current.second < depth_limit) {
+        for (const void* target : calls.direct) {
+          pending.push_back({target, current.second + 1});
+        }
+      }
+    }
+    return matches;
+  };
+  ContentBrowserImageFunctions result;
+  const auto generators = find_matches(static_cast<const void* const*>(table)[27], 2, generator_imports);
+  if (generators.size() == 1) {
+    const auto renderers = find_matches(generators.front(), 4, renderer_imports);
+    if (renderers.size() == 1) {
+      const auto calls = decode_native_function_calls(image, renderers.front(), decoder);
+      if (std::count(calls.imports.begin(), calls.imports.end(), renderer_imports.front()) == 1) {
+        const auto index = std::find(calls.imports.begin(), calls.imports.end(), renderer_imports.front()) - calls.imports.begin();
+        result = {generators.front(), renderers.front(), renderer_imports.front(), calls.import_returns[index]};
+      }
+    }
+  }
+  cs_close(&decoder);
+  return result;
+}
+
+struct LegacyMaterialLayout {
+  void** row_paint_slot = nullptr;
+  void** image_slot = nullptr;
+  size_t image_return_rva = 0;
+  const void* data_vtable = nullptr;
+  size_t row_data_offset = 0;
+  size_t flag_offset = 0;
+  size_t pointer_offset = 0;
+  size_t path_size_offset = 0;
+};
+
+LegacyMaterialLayout discover_legacy_material_layout(HMODULE module) {
+  const NativeImageView image(module);
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVCMaterialListCtrl@@", module));
+  const void* data_table = primary_rtti_vtable(find_vtables_for_type(".?AVCBrowserData@@", module));
+  void** draw_slot = image.import_slot("?drawImage@QPainter@@QEAAXAEBVQRect@@AEBVQImage@@@Z");
+  if (!draw_slot || !data_table || !memory_readable(table, 54 * sizeof(void*))) {
+    return {};
+  }
+  void** row_slot = const_cast<void**>(static_cast<void* const*>(table)) + 53;
+  if (!image.function_size(*row_slot)) {
+    return {};
+  }
+  const auto images = discover_content_browser_image_functions(module);
+  if (!images.generator) {
+    return {};
+  }
+  csh decoder = 0;
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  const auto row_calls = decode_native_function_calls(image, *row_slot, decoder);
+  LegacyMaterialLayout result;
+  if (row_calls.complete && std::count(row_calls.imports.begin(), row_calls.imports.end(), draw_slot) == 1) {
+    const auto index = std::find(row_calls.imports.begin(), row_calls.imports.end(), draw_slot) - row_calls.imports.begin();
+    result = {row_slot, draw_slot, row_calls.import_returns[index], data_table};
+  }
+  auto matches = [&image](const unsigned char* code, std::initializer_list<int> pattern) {
+    const auto address = reinterpret_cast<std::uintptr_t>(code);
+    const auto base = reinterpret_cast<std::uintptr_t>(image.base);
+    if (address < base || !image.contains(address - base, pattern.size())) {
+      return false;
+    }
+    size_t index = 0;
+    for (int value : pattern) {
+      if (value >= 0 && code[index] != value) {
+        return false;
+      }
+      ++index;
+    }
+    return true;
+  };
+  size_t row_accessors = 0;
+  size_t pointer_predicates = 0;
+  size_t path_predicates = 0;
+  size_t path_flag = 0;
+  for (const void* function : {static_cast<const void*>(*row_slot), images.generator}) {
+    cs_insn* instructions = nullptr;
+    const size_t count = cs_disasm(decoder, static_cast<const uint8_t*>(function), image.function_size(function),
+      reinterpret_cast<uint64_t>(function), 0, &instructions);
+    for (size_t index = 0; index < count; ++index) {
+      const auto& instruction = instructions[index];
+      if (instruction.id != X86_INS_CALL || instruction.detail->x86.op_count != 1 ||
+          instruction.detail->x86.operands[0].type != X86_OP_IMM) {
+        continue;
+      }
+      const auto* target = reinterpret_cast<const unsigned char*>(instruction.detail->x86.operands[0].imm);
+      if (function == *row_slot) {
+        if (matches(target, {0x48, 0x8b, 0x41, -1, 0xc3})) {
+          result.row_data_offset = target[3];
+          ++row_accessors;
+        }
+        continue;
+      }
+      if (matches(target, {0x80, 0xb9, -1, -1, -1, -1, 0, 0x75, 0x0d,
+          0x48, 0x83, 0xb9, -1, -1, -1, -1, 0, 0x74, 3, 0xb0, 1, 0xc3, 0x32, 0xc0, 0xc3})) {
+        result.flag_offset = read_unaligned_u32(target + 2);
+        result.pointer_offset = read_unaligned_u32(target + 12);
+        ++pointer_predicates;
+      }
+      if (matches(target, {0x48, 0x83, 0xec, 0x28, 0x80, 0xb9, -1, -1, -1, -1, 0,
+          0x75, 0x17, 0x48, 0x81, 0xc1, -1, -1, -1, -1, 0xe8, -1, -1, -1, -1,
+          0x84, 0xc0, 0x75, 7, 0xb0, 1, 0x48, 0x83, 0xc4, 0x28, 0xc3, 0x32, 0xc0,
+          0x48, 0x83, 0xc4, 0x28, 0xc3})) {
+        const auto displacement = static_cast<std::int32_t>(read_unaligned_u32(target + 21));
+        const auto* empty_check = target + 25 + displacement;
+        if (matches(empty_check, {0x48, 0x83, 0x79, -1, 0, 0x0f, 0x94, 0xc0, 0xc3})) {
+          path_flag = read_unaligned_u32(target + 6);
+          result.path_size_offset = read_unaligned_u32(target + 16) + empty_check[3];
+          ++path_predicates;
+        }
+      }
+    }
+    cs_free(instructions, count);
+  }
+  cs_close(&decoder);
+  if (!result.row_paint_slot || row_accessors != 1 || pointer_predicates != 1 || path_predicates != 1 ||
+      path_flag != result.flag_offset || result.row_data_offset < 8 || result.row_data_offset % 8 ||
+      result.flag_offset < 8 || result.flag_offset > 1024 || result.pointer_offset < 8 ||
+      result.pointer_offset > 1024 || result.pointer_offset % 8 || result.path_size_offset < 8 ||
+      result.path_size_offset > 1024 || result.path_size_offset % 8) {
+    return {};
+  }
+  return result;
+}
+
+bool is_legacy_material_folder(const LegacyMaterialLayout& layout, const void* row) {
+  if (!layout.row_paint_slot || !row || !memory_readable(row, layout.row_data_offset + sizeof(void*))) {
+    return false;
+  }
+  const auto* data = *reinterpret_cast<const unsigned char* const*>(static_cast<const unsigned char*>(row) + layout.row_data_offset);
+  const size_t size = std::max({layout.flag_offset, layout.pointer_offset, layout.path_size_offset}) + sizeof(void*);
+  return memory_readable(data, size) && *reinterpret_cast<const void* const*>(data) == layout.data_vtable &&
+    data[layout.flag_offset] == 0 && (read_unaligned_pointer(data + layout.pointer_offset) != 0 ||
+      read_unaligned_pointer(data + layout.path_size_offset) != 0);
+}
+
+bool create_legacy_material_image(const void* source, void* result) {
+  const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  const auto width_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?width@QImage@@QEBAHXZ"));
+  const auto height_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?height@QImage@@QEBAHXZ"));
+  const auto format_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?format@QImage@@QEBA?AW4Format@1@XZ"));
+  const auto pixel_proc = reinterpret_cast<unsigned int(__cdecl*)(const void*, int, int)>(GetProcAddress(gui, "?pixel@QImage@@QEBAIHH@Z"));
+  const auto set_pixel = reinterpret_cast<void(__cdecl*)(void*, int, int, unsigned int)>(GetProcAddress(gui, "?setPixel@QImage@@QEAAXHHI@Z"));
+  const auto copy_proc = reinterpret_cast<void(__cdecl*)(void*, const void*)>(GetProcAddress(gui, "??0QImage@@QEAA@AEBV0@@Z"));
+  if (!source || !result || !width_proc || !height_proc || !format_proc || !pixel_proc || !set_pixel || !copy_proc) {
+    return false;
+  }
+  const int width = width_proc(source);
+  const int height = height_proc(source);
+  const int format = format_proc(source);
+  if (width <= 0 || height <= 0 || width > 512 || height > 512 ||
+      (format != 4 && format != 5 && format != 6 && format != 13 && format != 29)) {
+    return false;
+  }
+  auto is_backing = [pixel_proc, source](int column, int row) {
+    const unsigned int pixel = pixel_proc(source, column, row);
+    const int red = (pixel >> 16) & 255;
+    const int green = (pixel >> 8) & 255;
+    const int blue = pixel & 255;
+    return (pixel >> 24) == 255 && std::min({red, green, blue}) >= 245 &&
+      std::max({red, green, blue}) - std::min({red, green, blue}) <= 8;
+  };
+  if (!is_backing(0, 0) || !is_backing(width - 1, 0) ||
+      !is_backing(0, height - 1) || !is_backing(width - 1, height - 1)) {
+    return false;
+  }
+  copy_proc(result, source);
+  std::vector<unsigned char> visited(static_cast<size_t>(width) * height);
+  std::vector<size_t> pending;
+  auto add = [&](int column, int row) {
+    if (column < 0 || row < 0 || column >= width || row >= height) {
+      return;
+    }
+    const size_t position = static_cast<size_t>(row) * width + column;
+    if (!visited[position]) {
+      visited[position] = 1;
+      if (is_backing(column, row)) {
+        pending.push_back(position);
+      }
+    }
+  };
+  for (int column = 0; column < width; ++column) {
+    add(column, 0);
+    add(column, height - 1);
+  }
+  for (int row = 0; row < height; ++row) {
+    add(0, row);
+    add(width - 1, row);
+  }
+  for (size_t index = 0; index < pending.size(); ++index) {
+    const int column = static_cast<int>(pending[index] % width);
+    const int row = static_cast<int>(pending[index] / width);
+    set_pixel(result, column, row, 0xff2b2b2b);
+    add(column - 1, row);
+    add(column + 1, row);
+    add(column, row - 1);
+    add(column, row + 1);
+  }
+  return true;
+}
+
+LegacyMaterialLayout g_legacy_material_layout;
+VcbStatusPaintHook g_legacy_material_row_hook;
+std::uintptr_t g_legacy_material_image_return = 0;
+thread_local bool g_legacy_material_folder_scope = false;
+struct LegacyMaterialImageCache {
+  long long key = 0;
+  bool constructed = false;
+  alignas(16) unsigned char image[256] = {};
+};
+std::vector<std::unique_ptr<LegacyMaterialImageCache>> g_legacy_material_images;
+
+using LegacyMaterialRowFn = void(__cdecl*)(void*, void*, void*, const void*);
+
+void __cdecl legacy_material_row_hook(void* widget, void* painter, void* row, const void* rect) {
+  const auto original = reinterpret_cast<LegacyMaterialRowFn>(g_legacy_material_row_hook.original_proc);
+  if (!original) {
+    return;
+  }
+  const bool previous = g_legacy_material_folder_scope;
+  g_legacy_material_folder_scope = is_legacy_material_folder(g_legacy_material_layout, row);
+  original(widget, painter, row, rect);
+  g_legacy_material_folder_scope = previous;
+}
+
+bool draw_legacy_material_image(void* painter, const void* rect, const void* image,
+    std::uintptr_t caller, ContentBrowserDrawPixmapFn original) {
+  if (!g_legacy_material_folder_scope || !g_legacy_material_image_return || caller != g_legacy_material_image_return) {
+    return false;
+  }
+  const auto cache_key = reinterpret_cast<long long(__cdecl*)(const void*)>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?cacheKey@QImage@@QEBA_JXZ"));
+  const long long key = cache_key ? cache_key(image) : 0;
+  if (!key) {
+    return false;
+  }
+  auto found = std::find_if(g_legacy_material_images.begin(), g_legacy_material_images.end(),
+    [key](const auto& cached) { return cached->key == key; });
+  if (found == g_legacy_material_images.end()) {
+    if (g_legacy_material_images.size() >= 32) {
+      if (g_legacy_material_images.front()->constructed) {
+        reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(g_legacy_material_images.front()->image);
+      }
+      g_legacy_material_images.erase(g_legacy_material_images.begin());
+    }
+    auto cached = std::make_unique<LegacyMaterialImageCache>();
+    cached->key = key;
+    cached->constructed = create_legacy_material_image(image, cached->image);
+    g_legacy_material_images.push_back(std::move(cached));
+    found = g_legacy_material_images.end() - 1;
+  }
+  if (!(*found)->constructed) {
+    return false;
+  }
+  original(painter, rect, (*found)->image);
+  return true;
+}
+
+bool set_legacy_material_image_hook(const QtLookup& lookup, bool dark) {
+  if (!dark) {
+    g_legacy_material_image_return = 0;
+    g_legacy_material_layout = {};
+    for (const auto& cached : g_legacy_material_images) {
+      if (cached->constructed) {
+        reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(cached->image);
+      }
+    }
+    g_legacy_material_images.clear();
+    if (!g_legacy_material_row_hook.slot) {
+      return true;
+    }
+    DWORD protection = 0;
+    if (!VirtualProtect(g_legacy_material_row_hook.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+      return false;
+    }
+    if (*g_legacy_material_row_hook.slot == reinterpret_cast<void*>(&legacy_material_row_hook)) {
+      *g_legacy_material_row_hook.slot = g_legacy_material_row_hook.original_proc;
+    }
+    DWORD unused = 0;
+    VirtualProtect(g_legacy_material_row_hook.slot, sizeof(void*), protection, &unused);
+    g_legacy_material_row_hook = {};
+    return true;
+  }
+  if (g_legacy_material_row_hook.slot) {
+    return *g_legacy_material_row_hook.slot == reinterpret_cast<void*>(&legacy_material_row_hook);
+  }
+  const HMODULE module = GetModuleHandleW(nullptr);
+  const auto layout = discover_legacy_material_layout(module);
+  if (!layout.row_paint_slot) {
+    return true;
+  }
+  if (!resolve_toolbar_title_paint_api(lookup)) {
+    return false;
+  }
+  if (!g_about_image_hook.slot) {
+    const auto original = GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"),
+      "?drawImage@QPainter@@QEAAXAEBVQRect@@AEBVQImage@@@Z");
+    DWORD protection = 0;
+    if (!original || *layout.image_slot != reinterpret_cast<void*>(original) ||
+        !VirtualProtect(layout.image_slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+      return false;
+    }
+    g_about_image_hook = {layout.image_slot, *layout.image_slot};
+    *layout.image_slot = reinterpret_cast<void*>(&about_draw_image_hook);
+    DWORD unused = 0;
+    VirtualProtect(layout.image_slot, sizeof(void*), protection, &unused);
+  }
+  if (g_about_image_hook.slot != layout.image_slot || *layout.image_slot != reinterpret_cast<void*>(&about_draw_image_hook)) {
+    return false;
+  }
+  DWORD protection = 0;
+  if (!VirtualProtect(layout.row_paint_slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  g_legacy_material_layout = layout;
+  g_legacy_material_row_hook = {layout.row_paint_slot, *layout.row_paint_slot};
+  g_legacy_material_image_return = reinterpret_cast<std::uintptr_t>(module) + layout.image_return_rva;
+  *layout.row_paint_slot = reinterpret_cast<void*>(&legacy_material_row_hook);
+  DWORD unused = 0;
+  VirtualProtect(layout.row_paint_slot, sizeof(void*), protection, &unused);
+  return true;
+}
+
+std::vector<DiscoveredFolderColor> discover_content_browser_folder_colors(HMODULE module) {
+  const NativeImageView image(module);
+  auto** color_slot = image.import_slot("??0QColor@@QEAA@HHHH@Z");
+  auto** outline_slot = image.import_slot("?drawRects@QPainter@@QEAAXPEBVQRect@@H@Z");
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVContentBrowserListCtrl@@", module));
+  if (!color_slot || !outline_slot || !memory_readable(table, 28 * sizeof(void*))) {
+    return {};
+  }
+  const void* paint = image.function_body(static_cast<const void* const*>(table)[27]);
+  const size_t length = image.function_size(paint);
+  csh decoder = 0;
+  if (!length || cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  cs_insn* instructions = nullptr;
+  const size_t count = cs_disasm(decoder, static_cast<const uint8_t*>(paint), length,
+    reinterpret_cast<uint64_t>(paint), 0, &instructions);
+  std::unordered_set<uint64_t> branch_targets;
+  for (size_t index = 0; index < count; ++index) {
+    const auto& instruction = instructions[index];
+    if (cs_insn_group(decoder, &instruction, CS_GRP_JUMP) &&
+        instruction.detail->x86.operands[0].type == X86_OP_IMM) {
+      branch_targets.insert(instruction.detail->x86.operands[0].imm);
+    }
+  }
+  long long values[16];
+  std::fill(std::begin(values), std::end(values), -1);
+  int alpha = -1;
+  DiscoveredFolderColor pending;
+  std::vector<DiscoveredFolderColor> result;
+  for (size_t index = 0; index < count; ++index) {
+    const auto& instruction = instructions[index];
+    const auto& operands = instruction.detail->x86;
+    if (branch_targets.count(instruction.address)) {
+      std::fill(std::begin(values), std::end(values), -1);
+      alpha = -1;
+      pending = {};
+    }
+    long long assigned = -1;
+    int destination = -1;
+    if (instruction.id == X86_INS_MOV && operands.op_count == 2) {
+      const auto& target = operands.operands[0];
+      const auto& source = operands.operands[1];
+      if (target.type == X86_OP_REG && target.size >= 4) {
+        destination = native_register_index(target.reg);
+        const int source_index = source.type == X86_OP_REG ? native_register_index(source.reg) : -1;
+        assigned = source.type == X86_OP_IMM ? source.imm : (source_index >= 0 ? values[source_index] : -1);
+      } else if (target.type == X86_OP_MEM && target.mem.base == X86_REG_RSP &&
+                 target.mem.index == X86_REG_INVALID && target.mem.disp == 0x20) {
+        alpha = source.type == X86_OP_IMM ? static_cast<int>(source.imm) : -1;
+      }
+    }
+    if (instruction.id == X86_INS_CALL) {
+      const auto& target = operands.operands[0];
+      const auto slot = target.type == X86_OP_MEM && target.mem.base == X86_REG_RIP
+        ? instruction.address + instruction.size + target.mem.disp : 0;
+      const size_t return_rva = instruction.address + instruction.size - reinterpret_cast<uint64_t>(image.base);
+      if (slot == reinterpret_cast<uint64_t>(color_slot)) {
+        pending = {};
+        if (alpha == 255 && values[2] == values[8] && values[2] == values[9] &&
+            (values[2] == 230 || values[2] == 240 || values[2] == 255)) {
+          pending = {return_rva, static_cast<int>(values[2]), 0};
+        }
+      } else if (slot == reinterpret_cast<uint64_t>(outline_slot) && pending.return_rva) {
+        if (values[8] == 1 && return_rva - pending.return_rva < 512) {
+          pending.outline_return_rva = return_rva;
+          result.push_back(pending);
+        }
+        pending = {};
+      }
+      for (int volatile_register : {0, 1, 2, 8, 9, 10, 11}) {
+        values[volatile_register] = -1;
+      }
+      alpha = -1;
+    } else if (cs_insn_group(decoder, &instruction, CS_GRP_JUMP) ||
+               cs_insn_group(decoder, &instruction, CS_GRP_RET)) {
+      std::fill(std::begin(values), std::end(values), -1);
+      alpha = -1;
+      pending = {};
+    } else {
+      cs_regs read = {}, written = {};
+      uint8_t read_count = 0, written_count = 0;
+      if (cs_regs_access(decoder, &instruction, read, &read_count, written, &written_count) == CS_ERR_OK) {
+        for (uint8_t register_index = 0; register_index < written_count; ++register_index) {
+          const int affected = native_register_index(written[register_index]);
+          if (affected >= 0) {
+            values[affected] = -1;
+          }
+        }
+      }
+      if (destination >= 0) {
+        values[destination] = assigned;
+      }
+    }
+  }
+  const bool complete = count && instructions[count - 1].address + instructions[count - 1].size ==
+    reinterpret_cast<uint64_t>(paint) + length;
+  cs_free(instructions, count);
+  cs_close(&decoder);
+  if (!complete || result.size() != 3 || result[0].native_shade != 230 ||
+      result[1].native_shade != 240 || result[2].native_shade != 255) {
+    return {};
+  }
+  return result;
+}
+
 std::vector<void**> content_browser_folder_color_slots(const unsigned char* image_base, size_t image_size,
                                                      void* original_proc, bool outline = false) {
   std::vector<void**> slots;
   if (!image_base || !original_proc) {
     return slots;
   }
-  for (const auto& color : k_content_browser_folder_colors) {
+  for (const auto& color : g_content_browser_folder_colors) {
     const size_t return_rva = outline ? color.outline_return_rva : color.return_rva;
-    if (return_rva > image_size) {
+    if (return_rva < 6 || return_rva > image_size) {
       return {};
     }
     const auto* instruction = image_base + return_rva - 6;
@@ -7398,7 +8584,7 @@ int content_browser_folder_background_shade(const void* return_address, int red,
   }
   const auto return_value = reinterpret_cast<std::uintptr_t>(return_address);
   const auto image_base = reinterpret_cast<std::uintptr_t>(g_content_browser_folder_color_image_base);
-  for (const auto& color : k_content_browser_folder_colors) {
+  for (const auto& color : g_content_browser_folder_colors) {
     if (return_value == image_base + color.return_rva && red == color.native_shade) {
       return color.dark_shade;
     }
@@ -7414,8 +8600,8 @@ bool draw_content_browser_folder_outline(const QtLookup& lookup, void* painter, 
   }
   const auto return_value = reinterpret_cast<std::uintptr_t>(return_address);
   const auto image_base = reinterpret_cast<std::uintptr_t>(g_content_browser_folder_color_image_base);
-  const bool folder_rectangle = std::any_of(std::begin(k_content_browser_folder_colors),
-    std::end(k_content_browser_folder_colors), [return_value, image_base](const auto& color) {
+  const bool folder_rectangle = std::any_of(g_content_browser_folder_colors.begin(),
+    g_content_browser_folder_colors.end(), [return_value, image_base](const auto& color) {
       return return_value == image_base + color.outline_return_rva;
     });
   if (!folder_rectangle) {
@@ -7461,6 +8647,11 @@ size_t clear_content_browser_cached_images(void* widget) {
     return 0;
   }
 
+  alignas(16) unsigned char empty_image[64] = {};
+  g_content_browser_qimage_default_ctor_proc(empty_image);
+  const void* expected_image_vtable = *reinterpret_cast<const void* const*>(empty_image);
+  g_content_browser_qimage_destructor_proc(empty_image);
+
   auto* widget_bytes = reinterpret_cast<unsigned char*>(widget);
   if (!memory_readable(widget_bytes + 0xf8, 2 * sizeof(void*))) {
     return 0;
@@ -7482,7 +8673,8 @@ size_t clear_content_browser_cached_images(void* widget) {
   size_t reset_count = 0;
   for (void** current = rows_begin; current != rows_end; ++current) {
     auto* row = reinterpret_cast<unsigned char*>(*current);
-    if (!row || !memory_readable(row + 0x60, 24)) {
+    if (!row || !memory_readable(row + 0x60, 24) ||
+        *reinterpret_cast<const void* const*>(row + 0x60) != expected_image_vtable) {
       continue;
     }
     __try {
@@ -7518,7 +8710,8 @@ void __fastcall content_browser_paint_scope_hook(void* widget, void* event) {
 
   if (g_content_browser_text_dark) {
     g_content_browser_paint_scope_depth += 1;
-    if (g_content_browser_image_cache_reset_widgets.insert(widget).second) {
+    if (!g_content_browser_qimage_fill_color_hooks.empty() &&
+        g_content_browser_image_cache_reset_widgets.insert(widget).second) {
       static_cast<void>(clear_content_browser_cached_images(widget));
     }
     if (InterlockedIncrement(&g_content_browser_paint_hook_invocation_count) == 1) {
@@ -7642,6 +8835,7 @@ void remove_content_browser_text_hooks() {
   g_content_browser_folder_outline_hooks.clear();
   g_content_browser_folder_outline_api = {};
   g_content_browser_folder_color_image_base = nullptr;
+  g_content_browser_folder_colors.clear();
   g_content_browser_qcolor_rgb_ctor_proc = nullptr;
   g_content_browser_qcolor_rgb_proc = nullptr;
   g_content_browser_qimage_default_ctor_proc = nullptr;
@@ -7761,15 +8955,11 @@ bool install_content_browser_text_hooks(bool dark) {
   const std::vector<const void*> content_browser_vtables = find_content_browser_list_vtables();
   void** paint_slot = nullptr;
   constexpr size_t paint_event_slot = 27;
-  for (const void* vtable : content_browser_vtables) {
+  if (const void* vtable = primary_rtti_vtable(content_browser_vtables)) {
     void** slots = const_cast<void**>(reinterpret_cast<void* const*>(vtable));
-    if (!memory_readable(slots, (paint_event_slot + 1) * sizeof(*slots))) {
-      continue;
-    }
-    const auto* candidate = reinterpret_cast<const unsigned char*>(slots[paint_event_slot]);
-    if (is_executable_address(candidate)) {
+    if (memory_readable(slots, (paint_event_slot + 1) * sizeof(*slots)) &&
+        is_executable_address(reinterpret_cast<const unsigned char*>(slots[paint_event_slot]))) {
       paint_slot = &slots[paint_event_slot];
-      break;
     }
   }
   if (!paint_slot) {
@@ -7783,6 +8973,11 @@ bool install_content_browser_text_hooks(bool dark) {
     return false;
   }
   const void* original_paint_proc = *paint_slot;
+  g_content_browser_folder_colors.clear();
+  for (const auto& color : discover_content_browser_folder_colors(GetModuleHandleW(nullptr))) {
+    const int dark_shade = color.native_shade == 230 ? 36 : (color.native_shade == 240 ? 40 : 43);
+    g_content_browser_folder_colors.push_back({color.return_rva, color.native_shade, dark_shade, color.outline_return_rva});
+  }
   const std::vector<void**> folder_color_slots = content_browser_folder_color_slots(
     image_base, image_size, reinterpret_cast<void*>(lookup.qcolor_rgb_ctor_proc));
   const std::vector<void**> folder_outline_slots = resolve_content_browser_folder_outline_api(lookup)
@@ -7796,32 +8991,20 @@ bool install_content_browser_text_hooks(bool dark) {
       reinterpret_cast<void*>(draw_text_flags_proc),
       reinterpret_cast<void*>(draw_text_rect_flags_proc)
     });
-  constexpr size_t resource_image_renderer_rva = 0x656b90;
-  void* resource_image_renderer_proc = const_cast<unsigned char*>(image_base + resource_image_renderer_rva);
-  const std::vector<void**> qimage_fill_color_slots = find_function_indirect_call_slots(
-    resource_image_renderer_proc, {reinterpret_cast<void*>(qimage_fill_color_proc)});
-  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-  using RtlLookupFunctionEntryFn = PRUNTIME_FUNCTION(WINAPI*)(DWORD64, PDWORD64, PUNWIND_HISTORY_TABLE);
-  const auto rtl_lookup_function_entry = ntdll
-    ? reinterpret_cast<RtlLookupFunctionEntryFn>(GetProcAddress(ntdll, "RtlLookupFunctionEntry"))
-    : nullptr;
-  auto resolve_function_range = [rtl_lookup_function_entry](void* function_proc,
-      const unsigned char*& function_begin, const unsigned char*& function_end) {
-    DWORD64 function_image_base = 0;
-    const PRUNTIME_FUNCTION function_entry = rtl_lookup_function_entry
-      ? rtl_lookup_function_entry(reinterpret_cast<DWORD64>(function_proc), &function_image_base, nullptr)
-      : nullptr;
-    if (function_entry && function_image_base != 0 && function_entry->EndAddress > function_entry->BeginAddress) {
-      function_begin = reinterpret_cast<const unsigned char*>(function_image_base + function_entry->BeginAddress);
-      function_end = reinterpret_cast<const unsigned char*>(function_image_base + function_entry->EndAddress);
-    }
-  };
-  constexpr size_t image_generator_rva = 0x595590;
-  void* image_generator_proc = const_cast<unsigned char*>(image_base + image_generator_rva);
-  resolve_function_range(image_generator_proc,
-    g_content_browser_image_generator_begin, g_content_browser_image_generator_end);
-  resolve_function_range(resource_image_renderer_proc,
-    g_content_browser_resource_image_renderer_begin, g_content_browser_resource_image_renderer_end);
+  std::vector<void**> qimage_fill_color_slots;
+  g_content_browser_image_generator_begin = nullptr;
+  g_content_browser_image_generator_end = nullptr;
+  g_content_browser_resource_image_renderer_begin = nullptr;
+  g_content_browser_resource_image_renderer_end = nullptr;
+  const auto image_functions = discover_content_browser_image_functions(executable);
+  if (image_functions.fill_slot && *image_functions.fill_slot == reinterpret_cast<void*>(qimage_fill_color_proc)) {
+    const NativeImageView image(executable);
+    g_content_browser_image_generator_begin = static_cast<const unsigned char*>(image_functions.generator);
+    g_content_browser_image_generator_end = g_content_browser_image_generator_begin + image.function_size(image_functions.generator);
+    g_content_browser_resource_image_renderer_begin = static_cast<const unsigned char*>(image_functions.renderer);
+    g_content_browser_resource_image_renderer_end = g_content_browser_resource_image_renderer_begin + image.function_size(image_functions.renderer);
+    qimage_fill_color_slots.push_back(image_functions.fill_slot);
+  }
   DWORD unused_protection = 0;
   if (draw_text_option_slots.empty() && draw_text_flags_slots.empty()) {
     VirtualProtect(paint_slot, sizeof(*paint_slot), original_protection, &unused_protection);
@@ -9563,12 +10746,10 @@ bool install_focus_returner_double_spin_box_change_event_hook() {
     return true;
   }
 
-  HMODULE executable = GetModuleHandleW(nullptr);
-  const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
-  constexpr size_t focus_returner_double_spin_box_vtable_rva = 0x1c70820;
+  const void* table = primary_rtti_vtable(find_vtables_for_type(".?AVQtFocusReturnerDoubleSpinBox@@"));
   constexpr size_t change_event_slot = 41;
-  void** slot = image_base ? reinterpret_cast<void**>(const_cast<unsigned char*>(
-    image_base + focus_returner_double_spin_box_vtable_rva + change_event_slot * sizeof(void*))) : nullptr;
+  void** slot = memory_readable(table, (change_event_slot + 1) * sizeof(void*))
+    ? const_cast<void**>(static_cast<void* const*>(table)) + change_event_slot : nullptr;
   if (!slot || !memory_readable(slot, sizeof(*slot)) || !*slot) {
     return false;
   }
@@ -9588,10 +10769,7 @@ bool install_focus_returner_double_spin_box_change_event_hook() {
 }
 
 size_t apply_scene_tab_search_dialog_palette(void* dialog) {
-  constexpr size_t search_scene_tab_dialog_vtable_rva = 0x1c9cda0;
-  HMODULE executable = GetModuleHandleW(nullptr);
-  const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
-  const void* expected_vtable = image_base ? image_base + search_scene_tab_dialog_vtable_rva : nullptr;
+  const void* expected_vtable = scene_tab_search_dialog_vtable();
   if (!pointer_looks_like_cpp_object(dialog) || !expected_vtable ||
       *reinterpret_cast<const void* const*>(dialog) != expected_vtable) {
     return 0;
@@ -9903,6 +11081,9 @@ bool call_qt_stylesheet(bool enabled) {
   const int palette_stage = enabled ? 45 : 46;
   const int windows_stage = enabled ? 47 : 48;
   const QtLookup& tags_header_lookup = resolve_qt_lookup();
+  if (enabled) {
+    prepare_dialog_show_types();
+  }
   const bool qt_color_scheme_ok = apply_qt_color_scheme(tags_header_lookup, enabled);
   size_t tag_header_color_count = 0;
   size_t entity_info_input_surface_count = 0;
@@ -9913,6 +11094,9 @@ bool call_qt_stylesheet(bool enabled) {
     tag_header_color_count = apply_tag_dialog_header_colors(tags_header_lookup, false, 66);
   }
   const bool tag_header_paint_hook_ok = install_tag_header_paint_hook(enabled);
+  static_cast<void>(set_tag_eye_icon_hook(tags_header_lookup, enabled));
+  static_cast<void>(set_about_image_hook(tags_header_lookup, enabled));
+  static_cast<void>(set_legacy_material_image_hook(tags_header_lookup, enabled));
   const bool component_text_hook_ok = install_content_browser_text_hooks(enabled);
   static_cast<void>(set_content_browser_search_icon_hook(tags_header_lookup, enabled));
   const bool outliner_text_hook_ok = install_component_navigator_paint_hook(enabled);
