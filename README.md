@@ -68,12 +68,6 @@ On unsupported platforms or SketchUp versions, the settings dialog displays the 
 
 The **Auto Check For Updates** toggle in Global Settings is enabled by default. When enabled, the extension checks for a newer stable release asynchronously once at startup, using the public [Dark Mode SKP releases](https://github.com/gordanog/Dark-Mode-SKP-Public/releases). No GitHub login or token is required.
 
-When a newer release is detected, the extension shows a native SketchUp notification with its icon and a Close action, using the same notification pattern as Auto Backup SKP. The message states that Dark Mode SKP is out of date and identifies the available version. Up-to-date results, network failures, and 15-second timeouts remain silent. There is no manual update button, repository link, or update-status text in the settings dialog.
-
-Disabling the setting prevents the next startup check and suppresses any notification from a check already in progress. Existing settings files inherit the enabled default until the user opts out.
-
-Release tags use `vMAJOR.MINOR.PATCH`. Drafts and prereleases are not offered. The checker does not download or install files, and it does not change the running native DLL.
-
 ## Development notes
 
 The native integration relies on version-specific SketchUp internals. Validate behavior against each supported SketchUp release before distributing a build.
