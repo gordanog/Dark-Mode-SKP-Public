@@ -1,8 +1,11 @@
+
 # DarkModeSKP
 
 DarkModeSKP is a Windows extension for SketchUp that applies a dark theme to Qt and native Windows interface elements. It combines a Ruby extension with a native C++ helper.
 
-<img width="1906" height="1073" alt="image" src="https://github.com/user-attachments/assets/6eb45ec4-a9aa-49de-a8ab-64a1644cbe3f" />
+<img width="1906" height="1073" alt="Screenshot 2026-11-07 121147" src="https://github.com/user-attachments/assets/fb002f7c-55cb-4e25-b7b5-09ca20ebbd81" />
+
+*The navigation cube in the top-right corner is the [Viewport Advanced SKP](https://extensions.sketchup.com/extension/cd54da6d-9823-4ac7-9135-974f8988d6a9) extension.*
 
 ## Repository layout
 
@@ -63,10 +66,6 @@ The resulting `DarkModeSKP.rbz` must contain `DarkModeSKP.rb` and the `DarkModeS
 4. Choose the desired Dark Mode state, then restart SketchUp when the dialog requests it.
 
 On unsupported platforms or SketchUp versions, the settings dialog displays the compatibility requirement and disables its toggles.
-
-## Update Checks
-
-The **Auto Check For Updates** toggle in Global Settings is enabled by default. When enabled, the extension checks for a newer stable release asynchronously once at startup, using the public [Dark Mode SKP releases](https://github.com/gordanog/Dark-Mode-SKP-Public/releases). No GitHub login or token is required.
 
 ## Development notes
 
