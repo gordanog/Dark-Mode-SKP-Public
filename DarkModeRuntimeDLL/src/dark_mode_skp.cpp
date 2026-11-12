@@ -9,6 +9,7 @@
 #include <capstone/capstone.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstddef>
@@ -24,6 +25,7 @@
 #include <new>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -158,7 +160,6 @@ volatile LONG g_content_browser_paint_hook_invocation_count = 0;
 volatile LONG g_content_browser_folder_image_fill_hook_invocation_count = 0;
 thread_local int g_content_browser_paint_scope_depth = 0;
 std::mutex g_icon_theme_mutex;
-std::mutex g_icon_theme_status_mutex;
 volatile LONG g_icon_theme_enabled = 0;
 volatile LONG g_icon_theme_resource_color_count = 0;
 volatile LONG g_icon_theme_chevron_resource_color_count = 0;
@@ -168,7 +169,7 @@ volatile LONG g_icon_theme_tray_chevron_widget_count = 0;
 volatile LONG g_icon_theme_tray_chevron_header_count = 0;
 volatile LONG g_icon_theme_component_navigator_search_icon_count = 0;
 volatile LONG g_icon_theme_page_tabs_search_icon_count = 0;
-std::filesystem::path g_icon_theme_status_path;
+std::filesystem::path g_icon_theme_inventory_directory;
 struct CefBaseRefCounted {
   size_t size = 0;
   void(__fastcall* add_ref)(CefBaseRefCounted* self) = nullptr;
@@ -1447,6 +1448,75 @@ const QtLookup& resolve_qt_lookup() {
   return incomplete_lookup;
 }
 
+struct WidgetThemeApi {
+  void*(__cdecl* property)(const void*, void*, const char*) = nullptr;
+  bool(__cdecl* set_property)(void*, const char*, const void*) = nullptr;
+  void(__cdecl* variant_destroy)(void*) = nullptr;
+  void(__cdecl* variant_default)(void*) = nullptr;
+  void(__cdecl* variant_bytes)(void*, const void*) = nullptr;
+  void(__cdecl* bytes_ctor)(void*, const char*, long long) = nullptr;
+  void*(__cdecl* to_bytes)(const void*, void*) = nullptr;
+  const char*(__cdecl* type_name)(const void*) = nullptr;
+  const void*(__cdecl* variant_data)(const void*) = nullptr;
+  void*(__cdecl* palette_variant)(const void*, void*) = nullptr;
+  long long(__cdecl* palette_key)(const void*) = nullptr;
+};
+
+const WidgetThemeApi& widget_theme_api() {
+  static const auto api = [] {
+    WidgetThemeApi result;
+    const HMODULE core = GetModuleHandleW(L"Qt6Core.dll");
+    const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+    result.property = reinterpret_cast<decltype(result.property)>(GetProcAddress(core, "?property@QObject@@QEBA?AVQVariant@@PEBD@Z"));
+    result.set_property = reinterpret_cast<decltype(result.set_property)>(GetProcAddress(core, "?setProperty@QObject@@QEAA_NPEBDAEBVQVariant@@@Z"));
+    result.variant_destroy = reinterpret_cast<decltype(result.variant_destroy)>(GetProcAddress(core, "??1QVariant@@QEAA@XZ"));
+    result.variant_default = reinterpret_cast<decltype(result.variant_default)>(GetProcAddress(core, "??0QVariant@@QEAA@XZ"));
+    result.variant_bytes = reinterpret_cast<decltype(result.variant_bytes)>(GetProcAddress(core, "??0QVariant@@QEAA@AEBVQByteArray@@@Z"));
+    result.bytes_ctor = reinterpret_cast<decltype(result.bytes_ctor)>(GetProcAddress(core, "??0QByteArray@@QEAA@PEBD_J@Z"));
+    result.to_bytes = reinterpret_cast<decltype(result.to_bytes)>(GetProcAddress(core, "?toByteArray@QVariant@@QEBA?AVQByteArray@@XZ"));
+    result.type_name = reinterpret_cast<decltype(result.type_name)>(GetProcAddress(core, "?typeName@QVariant@@QEBAPEBDXZ"));
+    result.variant_data = reinterpret_cast<decltype(result.variant_data)>(GetProcAddress(core, "?constData@QVariant@@QEBAPEBXXZ"));
+    result.palette_variant = reinterpret_cast<decltype(result.palette_variant)>(GetProcAddress(gui, "??BQPalette@@QEBA?AVQVariant@@XZ"));
+    result.palette_key = reinterpret_cast<decltype(result.palette_key)>(GetProcAddress(gui, "?cacheKey@QPalette@@QEBA_JXZ"));
+    return result;
+  }();
+  return api;
+}
+
+bool widget_theme_stamp(const QtLookup& lookup, void* widget, const char* name, bool store,
+                        const void* style = nullptr, const void* parent = nullptr, size_t surface = 0) {
+  const auto& api = widget_theme_api();
+  if (!widget || !api.property || !api.set_property || !api.variant_destroy || !api.variant_bytes ||
+      !api.bytes_ctor || !api.to_bytes || !api.palette_key || !lookup.widget_palette_proc ||
+      !lookup.qbytearray_size_proc || !lookup.qbytearray_const_data_proc || !lookup.qbytearray_destructor_proc) {
+    return false;
+  }
+  const void* palette = reinterpret_cast<const void*(__cdecl*)(const void*)>(lookup.widget_palette_proc)(widget);
+  if (!palette) {
+    return false;
+  }
+  const std::uintptr_t stamp[] = {static_cast<std::uintptr_t>(api.palette_key(palette)),
+    reinterpret_cast<std::uintptr_t>(style), reinterpret_cast<std::uintptr_t>(parent), surface};
+  alignas(16) unsigned char value[64] = {};
+  alignas(16) unsigned char bytes[64] = {};
+  bool matches = false;
+  if (store) {
+    api.bytes_ctor(bytes, reinterpret_cast<const char*>(stamp), sizeof(stamp));
+    api.variant_bytes(value, bytes);
+    api.set_property(widget, name, value);
+    matches = true;
+  } else {
+    api.property(widget, value, name);
+    api.to_bytes(value, bytes);
+    const auto size = reinterpret_cast<long long(__cdecl*)(const void*)>(lookup.qbytearray_size_proc)(bytes);
+    const auto data = reinterpret_cast<const char*(__cdecl*)(const void*)>(lookup.qbytearray_const_data_proc)(bytes);
+    matches = size == sizeof(stamp) && data && std::memcmp(data, stamp, sizeof(stamp)) == 0;
+  }
+  reinterpret_cast<void(__cdecl*)(void*)>(lookup.qbytearray_destructor_proc)(bytes);
+  api.variant_destroy(value);
+  return matches;
+}
+
 bool apply_qt_color_scheme(const QtLookup& lookup, bool dark) {
   if (!lookup.gui_style_hints_proc || !lookup.style_hints_set_color_scheme_proc) {
     return false;
@@ -2069,15 +2139,46 @@ std::string qt_object_safe_detail(const QtLookup& lookup, const void* object) {
   return "object=" + pointer_hex(object) + " class=" + qobject_class_name_quiet(lookup, object) + " " + qobject_inherits_summary(lookup, object) + " " + qobject_inherits_detail(lookup, object);
 }
 
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_widget_list_releases = 0;
+#endif
+
+struct OwnedQtWidgetList {
+  alignas(16) unsigned char storage[64] = {};
+  using Deallocate = void(__cdecl*)(void*, std::intptr_t, std::intptr_t);
+  Deallocate deallocate = nullptr;
+
+  OwnedQtWidgetList() {
+    static const auto release = reinterpret_cast<Deallocate>(GetProcAddress(GetModuleHandleW(L"Qt6Core.dll"),
+      "?deallocate@QArrayData@@SAXPEAU1@_J1@Z"));
+    deallocate = release;
+  }
+  OwnedQtWidgetList(const OwnedQtWidgetList&) = delete;
+  OwnedQtWidgetList& operator=(const OwnedQtWidgetList&) = delete;
+  ~OwnedQtWidgetList() {
+    void* header = nullptr;
+    std::memcpy(&header, storage, sizeof(header));
+    if (header && deallocate && InterlockedDecrement(static_cast<volatile LONG*>(header)) == 0) {
+      deallocate(header, sizeof(void*), alignof(void*));
+#if defined(DARKMODE_RUNTIME_TESTING)
+      ++g_test_widget_list_releases;
+#endif
+    }
+  }
+};
+
 size_t dump_qwidget_list_return(FARPROC list_proc, std::vector<void*>& widgets, size_t log_limit) {
   if (!list_proc) {
     return 0;
   }
 
   using QtWidgetListReturnFn = void(__cdecl*)(void*);
-  alignas(16) unsigned char list_storage[64] = {};
-  reinterpret_cast<QtWidgetListReturnFn>(list_proc)(list_storage);
-  QtPointerListView view = decode_qt_pointer_list(list_storage);
+  OwnedQtWidgetList list;
+  if (!list.deallocate) {
+    return 0;
+  }
+  reinterpret_cast<QtWidgetListReturnFn>(list_proc)(list.storage);
+  QtPointerListView view = decode_qt_pointer_list(list.storage);
 
   const size_t count = static_cast<size_t>(std::max<long long>(0, view.size));
   const size_t limit = std::min(count, log_limit);
@@ -2743,19 +2844,12 @@ bool read_omnibar_stylesheet(const QtLookup& lookup, const void* widget, std::st
   return readable;
 }
 
-bool apply_omnibar_dialog_stylesheet(const QtLookup& lookup, void* widget, bool dark) {
-  if (!widget || !lookup.from_utf8_proc || !lookup.widget_set_stylesheet_proc ||
+bool apply_widget_color_rule(const QtLookup& lookup, void* widget, bool dark, const char* rule) {
+  if (!widget || !rule || !*rule || !lookup.from_utf8_proc || !lookup.widget_set_stylesheet_proc ||
       !lookup.widget_stylesheet_proc || !lookup.qstring_destructor_proc) {
     return false;
   }
 
-  static constexpr char rule[] =
-    "\n/* DarkModeSKP Omnibar colors */\n"
-    "QFrame { background-color: #2b2b2b; color: #d8dbe2; }\n"
-    "QLabel { background-color: transparent; color: #d8dbe2; }\n"
-    "QLineEdit { background-color: #242424; color: #e6e8ee; selection-background-color: #4772b3; selection-color: #ffffff; }\n"
-    "QTreeView { background-color: #242424; alternate-background-color: #303030; color: #e6e8ee; selection-background-color: #6f94ce; selection-color: #ffffff; }\n"
-    "QTreeView::item:hover, QTreeView::item:selected { background-color: #6f94ce; color: #ffffff; }\n";
   std::string stylesheet;
   if (!read_omnibar_stylesheet(lookup, widget, stylesheet)) {
     return false;
@@ -2767,7 +2861,7 @@ bool apply_omnibar_dialog_stylesheet(const QtLookup& lookup, void* widget, bool 
   if (dark) {
     stylesheet += rule;
   } else {
-    stylesheet.erase(position, sizeof(rule) - 1);
+    stylesheet.erase(position, std::strlen(rule));
   }
   alignas(16) unsigned char storage[64] = {};
   if (lookup.from_utf8_symbol.find("_J") != std::string::npos) {
@@ -2780,6 +2874,163 @@ bool apply_omnibar_dialog_stylesheet(const QtLookup& lookup, void* widget, bool 
   reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.widget_set_stylesheet_proc)(widget, storage);
   reinterpret_cast<void(__cdecl*)(void*)>(lookup.qstring_destructor_proc)(storage);
   return true;
+}
+
+bool apply_omnibar_dialog_stylesheet(const QtLookup& lookup, void* widget, bool dark) {
+  static constexpr char rule[] =
+    "\n/* DarkModeSKP Omnibar colors */\n"
+    "QFrame { background-color: #2b2b2b; color: #d8dbe2; }\n"
+    "QLabel { background-color: transparent; color: #d8dbe2; }\n"
+    "QLineEdit { background-color: #242424; color: #e6e8ee; selection-background-color: #4772b3; selection-color: #ffffff; }\n"
+    "QTreeView { background-color: #242424; alternate-background-color: #303030; color: #e6e8ee; selection-background-color: #6f94ce; selection-color: #ffffff; }\n"
+    "QTreeView::item:hover, QTreeView::item:selected { background-color: #6f94ce; color: #ffffff; }\n";
+  return apply_widget_color_rule(lookup, widget, dark, rule);
+}
+
+enum class ModernWorkspaceSurface { None, Tabs, TrayTitle, TrayFrame, EntityInfo, Notification };
+
+void prepare_modern_workspace_types();
+
+std::string recolor_modern_workspace_stylesheet(std::string text, ModernWorkspaceSurface surface) {
+  std::string selector;
+  std::string property;
+  size_t statement = 0;
+  bool in_block = true;
+  const auto lower = [](std::string value) {
+    for (char& character : value) {
+      character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    }
+    return value;
+  };
+  for (size_t cursor = 0; cursor < text.size();) {
+    if (text.compare(cursor, 2, "/*") == 0) {
+      const size_t end = text.find("*/", cursor + 2);
+      if (end == std::string::npos) {
+        break;
+      }
+      cursor = end + 2;
+      continue;
+    }
+    if (text[cursor] == '\'' || text[cursor] == '"') {
+      const char quote = text[cursor++];
+      while (cursor < text.size()) {
+        if (text[cursor] == '\\' && cursor + 1 < text.size()) {
+          cursor += 2;
+        } else if (text[cursor++] == quote) {
+          break;
+        }
+      }
+      continue;
+    }
+    if (text[cursor] == '{') {
+      selector = lower(text.substr(statement, cursor - statement));
+      in_block = true;
+      property.clear();
+      statement = ++cursor;
+      continue;
+    }
+    if (text[cursor] == '}' || text[cursor] == ';') {
+      if (text[cursor] == '}') {
+        in_block = false;
+      }
+      property.clear();
+      statement = ++cursor;
+      continue;
+    }
+    if (in_block && property.empty() && text[cursor] == ':') {
+      property = lower(text.substr(statement, cursor - statement));
+      property.erase(std::remove_if(property.begin(), property.end(), [](unsigned char value) {
+        return std::isspace(value) != 0;
+      }), property.end());
+      ++cursor;
+      continue;
+    }
+    const bool foreground = property == "color";
+    const bool background = property == "background" || property == "background-color";
+    const bool border = property == "border" || property == "border-color" ||
+      property == "border-top" || property == "border-bottom" || property == "border-left" || property == "border-right" ||
+      property == "border-top-color" || property == "border-bottom-color" ||
+      property == "border-left-color" || property == "border-right-color";
+    if (!in_block || (!foreground && !background && !border)) {
+      ++cursor;
+      continue;
+    }
+    if (lower(text.substr(cursor, 4)) == "url(") {
+      const size_t end = text.find(')', cursor + 4);
+      if (end == std::string::npos) {
+        break;
+      }
+      cursor = end + 1;
+      continue;
+    }
+    int red = -1;
+    int green = -1;
+    int blue = -1;
+    size_t length = 0;
+    if (text[cursor] == '#') {
+      size_t end = cursor + 1;
+      while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end]))) {
+        ++end;
+      }
+      const size_t digits = end - cursor - 1;
+      if ((digits == 3 || digits == 6) &&
+          (end == text.size() || (!std::isalnum(static_cast<unsigned char>(text[end])) && text[end] != '_'))) {
+        const unsigned long rgb = std::stoul(text.substr(cursor + 1, digits), nullptr, 16);
+        red = digits == 3 ? static_cast<int>((rgb >> 8) & 15) * 17 : static_cast<int>((rgb >> 16) & 255);
+        green = digits == 3 ? static_cast<int>((rgb >> 4) & 15) * 17 : static_cast<int>((rgb >> 8) & 255);
+        blue = digits == 3 ? static_cast<int>(rgb & 15) * 17 : static_cast<int>(rgb & 255);
+        length = digits + 1;
+      }
+    } else if (std::isalpha(static_cast<unsigned char>(text[cursor]))) {
+      size_t end = cursor;
+      while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '-')) {
+        ++end;
+      }
+      const std::string token = lower(text.substr(cursor, end - cursor));
+      if (token == "white" || token == "black") {
+        red = green = blue = token == "white" ? 255 : 0;
+        length = end - cursor;
+      } else if (token == "rgb" && end < text.size() && text[end] == '(') {
+        int consumed = 0;
+        if (sscanf_s(text.c_str() + end, "( %d , %d , %d )%n", &red, &green, &blue, &consumed) == 3 &&
+            consumed > 0 && red >= 0 && red <= 255 && green >= 0 && green <= 255 && blue >= 0 && blue <= 255) {
+          length = end - cursor + static_cast<size_t>(consumed);
+        }
+      }
+      if (!length) {
+        cursor = end;
+        continue;
+      }
+    }
+    const bool neutral = red >= 0 && red == green && green == blue;
+    const bool native_blue = (red == 14 && green == 65 && blue == 108) || (red == 0 && green == 154 && blue == 217);
+    if (!length || (!neutral && !native_blue)) {
+      cursor += std::max<size_t>(1, length);
+      continue;
+    }
+    const char* replacement = nullptr;
+    if (foreground) {
+      replacement = surface == ModernWorkspaceSurface::Notification ?
+        (selector.find(":disabled") != std::string::npos ? "#8e939b" : "#d8dbe2") : "palette(window-text)";
+    } else if (neutral && red >= 128) {
+      replacement = border ? "#3a3a3a" : surface == ModernWorkspaceSurface::Tabs || surface == ModernWorkspaceSurface::TrayTitle
+        ? "#303030" : "#2b2b2b";
+      if (background && surface == ModernWorkspaceSurface::Tabs) {
+        if (selector.find(":selected") != std::string::npos || selector.find(":checked") != std::string::npos) {
+          replacement = "#454545";
+        } else if (selector.find(":hover") != std::string::npos) {
+          replacement = "#3a3a3a";
+        }
+      }
+    }
+    if (replacement) {
+      text.replace(cursor, length, replacement);
+      cursor += std::strlen(replacement);
+    } else {
+      cursor += length;
+    }
+  }
+  return text;
 }
 
 const void* omnibar_dialog_vtable();
@@ -3403,10 +3654,14 @@ bool install_about_sketchup_window_hook() {
 }
 
 size_t apply_scene_tab_search_dialog_palette(void* dialog);
+const void* notification_vtable();
+size_t apply_notification_style(const QtLookup& lookup, void* widget, bool dark,
+                                const void* expected = notification_vtable());
 
 bool install_non_customizable_toolbar_title_hook(const QtLookup& lookup, void* widget);
 bool is_sketchup_toolbar(const QtLookup& lookup, const void* widget);
 bool install_style_control_hook(const QtLookup& lookup, const void* widget);
+bool install_style_control_slot(void** slot);
 void remove_unused_style_control_hooks();
 
 void CALLBACK qmenu_window_event(
@@ -3443,6 +3698,10 @@ void CALLBACK qmenu_window_event(
   }
 
   if (apply_omnibar_dialog_style(lookup, widget, true)) {
+    return;
+  }
+
+  if (apply_notification_style(lookup, widget, true) > 0) {
     return;
   }
 
@@ -3483,7 +3742,6 @@ bool install_qmenu_window_hook() {
 }
 
 bool icon_theme_enabled();
-void write_icon_theme_status(const char* phase);
 bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget = nullptr);
 
 void CALLBACK page_tabs_search_refresh_window_event(
@@ -3512,9 +3770,6 @@ void CALLBACK page_tabs_search_refresh_window_event(
   // version-specific icon must not cause an allWidgets scan on every event.
   const bool refreshed = refresh_page_tabs_search_icon(lookup, widget);
   InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, refreshed ? 1 : 0);
-  if (refreshed && icon_theme_enabled()) {
-    write_icon_theme_status("enabled");
-  }
 }
 
 bool install_page_tabs_search_refresh_hook() {
@@ -4650,14 +4905,24 @@ std::string msvc_rtti_type_name(const void* object) {
   }
   const auto* type_name = reinterpret_cast<const char*>(type_descriptor + 16);
   std::string name;
-  for (size_t index = 0; index < 256; ++index) {
-    if (!memory_readable(type_name + index, 1)) {
+  while (name.size() < 256) {
+    const char* current = type_name + name.size();
+    MEMORY_BASIC_INFORMATION region = {};
+    if (VirtualQuery(current, &region, sizeof(region)) != sizeof(region) || region.State != MEM_COMMIT ||
+        (region.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
       return {};
     }
-    if (type_name[index] == '\0') {
+    const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    const auto address = reinterpret_cast<std::uintptr_t>(current);
+    if (end <= address) {
+      return {};
+    }
+    const size_t length = std::min<size_t>(256 - name.size(), end - address);
+    const char* terminator = static_cast<const char*>(std::memchr(current, 0, length));
+    name.append(current, terminator ? static_cast<size_t>(terminator - current) : length);
+    if (terminator) {
       return name;
     }
-    name.push_back(type_name[index]);
   }
   return {};
 }
@@ -4696,20 +4961,18 @@ std::vector<const void*> find_vtables_for_type(const char* type_name, HMODULE ex
   }
 
   const size_t image_size = nt_headers->OptionalHeader.SizeOfImage;
-  if (image_size == 0 || !memory_readable(image_base, image_size)) {
+  const size_t section_offset = static_cast<size_t>(dos_header->e_lfanew) +
+    offsetof(IMAGE_NT_HEADERS64, OptionalHeader) + nt_headers->FileHeader.SizeOfOptionalHeader;
+  const size_t section_table_size = static_cast<size_t>(nt_headers->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+  if (section_offset >= image_size || section_table_size > image_size - section_offset) {
     return vtables;
   }
-
-  const size_t type_name_length = std::strlen(type_name);
-  const auto* type_name_address = std::search(image_base, image_base + image_size, type_name, type_name + type_name_length);
-  if (type_name_address == image_base + image_size || type_name_address < image_base + 16) {
+  const auto* section = reinterpret_cast<const IMAGE_SECTION_HEADER*>(image_base + section_offset);
+  if (!memory_readable(section, section_table_size)) {
     return vtables;
   }
-  const auto* type_descriptor = type_name_address - 16;
-  const std::uint32_t type_descriptor_rva = static_cast<std::uint32_t>(type_descriptor - image_base);
 
   std::vector<ImageReadSection> read_sections;
-  const auto* section = IMAGE_FIRST_SECTION(nt_headers);
   for (WORD index = 0; index < nt_headers->FileHeader.NumberOfSections; ++index) {
     const IMAGE_SECTION_HEADER& current = section[index];
     if ((current.Characteristics & IMAGE_SCN_MEM_READ) == 0 || (current.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 || current.VirtualAddress >= image_size) {
@@ -4722,6 +4985,22 @@ std::vector<const void*> find_vtables_for_type(const char* type_name, HMODULE ex
       read_sections.push_back({section_begin, section_size});
     }
   }
+
+  const size_t type_name_length = std::strlen(type_name);
+  const unsigned char* type_descriptor = nullptr;
+  for (const ImageReadSection& read_section : read_sections) {
+    const auto* section_end = read_section.begin + read_section.size;
+    const auto* type_name_address = std::search(read_section.begin + 16, section_end,
+      type_name, type_name + type_name_length + 1);
+    if (type_name_address != section_end) {
+      type_descriptor = type_name_address - 16;
+      break;
+    }
+  }
+  if (!type_descriptor) {
+    return vtables;
+  }
+  const std::uint32_t type_descriptor_rva = static_cast<std::uint32_t>(type_descriptor - image_base);
 
   std::vector<const unsigned char*> complete_object_locators;
   for (const ImageReadSection& read_section : read_sections) {
@@ -4784,6 +5063,11 @@ const void* scene_tab_search_dialog_vtable() {
   return vtable;
 }
 
+const void* notification_vtable() {
+  static const void* vtable = primary_rtti_vtable(find_vtables_for_type(".?AVCToastNotification@@"));
+  return vtable;
+}
+
 const std::vector<const void*>& page_tabs_vtables() {
   static const auto vtables = find_vtables_for_type(".?AVCPageTabs@@");
   return vtables;
@@ -4792,7 +5076,9 @@ const std::vector<const void*>& page_tabs_vtables() {
 void prepare_dialog_show_types() {
   static_cast<void>(omnibar_dialog_vtable());
   static_cast<void>(scene_tab_search_dialog_vtable());
+  static_cast<void>(notification_vtable());
   static_cast<void>(page_tabs_vtables());
+  prepare_modern_workspace_types();
 }
 
 std::vector<const void*> find_vcb_edit_vtables() {
@@ -5565,6 +5851,782 @@ std::vector<void**> find_main_import_iat_slots_for_target(void* target_proc, HMO
   return slots;
 }
 
+struct ModernWorkspaceType {
+  const void* vtable = nullptr;
+  ModernWorkspaceSurface surface = ModernWorkspaceSurface::None;
+  bool scene_tabs = false;
+};
+
+std::vector<ModernWorkspaceType> discover_modern_workspace_types(HMODULE image) {
+  const void* entity_info = primary_rtti_vtable(find_vtables_for_type(".?AVCEntityInfoDlgV2@@", image));
+  if (!entity_info) {
+    return {};
+  }
+  std::vector<ModernWorkspaceType> types = {{entity_info, ModernWorkspaceSurface::EntityInfo}};
+  const std::pair<const char*, ModernWorkspaceSurface> names[] = {
+    {".?AVCPageTabs@@", ModernWorkspaceSurface::Tabs},
+    {".?AVCTabBar@@", ModernWorkspaceSurface::Tabs},
+    {".?AVPanelTabBar@@", ModernWorkspaceSurface::Tabs},
+    {".?AVPanelTabElement@@", ModernWorkspaceSurface::Tabs},
+    {".?AVPlusTabBar@@", ModernWorkspaceSurface::Tabs},
+    {".?AVSketchUpTabBarWidget@@", ModernWorkspaceSurface::Tabs},
+    {".?AVSketchUpTitleBarWidget@@", ModernWorkspaceSurface::TrayTitle},
+    {".?AVViewDockWidget@@", ModernWorkspaceSurface::TrayFrame},
+    {".?AVSketchUpStackWidget@@", ModernWorkspaceSurface::TrayFrame},
+    {".?AVSketchUpFloatingWindowWidget@@", ModernWorkspaceSurface::TrayFrame},
+    {".?AVEntityInfoControlsTabV2@@", ModernWorkspaceSurface::EntityInfo}
+  };
+  for (const auto& entry : names) {
+    if (const void* vtable = primary_rtti_vtable(find_vtables_for_type(entry.first, image))) {
+      types.push_back({vtable, entry.second, std::strcmp(entry.first, ".?AVCPageTabs@@") == 0});
+    }
+  }
+  return types;
+}
+
+#if defined(DARKMODE_RUNTIME_TESTING)
+const std::vector<ModernWorkspaceType>* g_test_modern_workspace_types = nullptr;
+#endif
+
+const std::vector<ModernWorkspaceType>& modern_workspace_types() {
+#if defined(DARKMODE_RUNTIME_TESTING)
+  if (g_test_modern_workspace_types) {
+    return *g_test_modern_workspace_types;
+  }
+#endif
+  static const auto types = discover_modern_workspace_types(GetModuleHandleW(nullptr));
+  return types;
+}
+
+void prepare_modern_workspace_types() {
+  static_cast<void>(modern_workspace_types());
+}
+
+ModernWorkspaceSurface modern_workspace_surface(const QtLookup& lookup, const void* widget,
+                                               const std::vector<ModernWorkspaceType>& types) {
+  if (types.empty()) {
+    return ModernWorkspaceSurface::None;
+  }
+  for (int depth = 0; widget && depth < 16; ++depth) {
+    if (!pointer_looks_like_cpp_object(widget)) {
+      break;
+    }
+    if (qt_object_inherits(lookup, widget, "CPanelHeader")) {
+      return ModernWorkspaceSurface::None;
+    }
+    const void* vtable = *static_cast<const void* const*>(widget);
+    for (const auto& type : types) {
+      if (type.vtable == vtable) {
+        return type.surface;
+      }
+    }
+    widget = qwidget_parent_widget(lookup, const_cast<void*>(widget));
+  }
+  return ModernWorkspaceSurface::None;
+}
+
+bool g_modern_workspace_dark = false;
+LONG g_modern_workspace_title_draws = 0;
+LONG g_modern_workspace_tab_draws = 0;
+bool set_modern_workspace_frame_hook(bool enabled, HMODULE module = nullptr);
+thread_local bool g_modern_workspace_style_applying = false;
+std::vector<VcbStatusPaintHook> g_modern_workspace_style_hooks;
+
+struct ModernWorkspacePaintApi {
+  void(__cdecl* brush_color)(void*, const void*) = nullptr;
+  void(__cdecl* brush_ctor)(void*, const void*, int) = nullptr;
+  void(__cdecl* fill_rect)(void*, const void*, const void*) = nullptr;
+  void(__cdecl* pen_ctor)(void*, const void*) = nullptr;
+  unsigned int(__cdecl* rgba)(const void*) = nullptr;
+  void(__cdecl* tab_copy)(void*, const void*) = nullptr;
+  void(__cdecl* tab_destroy)(void*) = nullptr;
+  void(__cdecl* dock_copy)(void*, const void*) = nullptr;
+  void(__cdecl* dock_destroy)(void*) = nullptr;
+  long long(__cdecl* palette_key)(const void*) = nullptr;
+  unsigned long long(__cdecl* palette_mask)(const void*) = nullptr;
+  int(__cdecl* palette_group)(const void*) = nullptr;
+  void*(__cdecl* palette_assign)(void*, const void*) = nullptr;
+  void*(__cdecl* cursor_pos)(void*) = nullptr;
+  void*(__cdecl* map_from_global)(const void*, void*, const void*) = nullptr;
+  void(__cdecl* option_copy)(void*, const void*) = nullptr;
+  void(__cdecl* option_destroy)(void*) = nullptr;
+  void(__cdecl* frame_copy)(void*, const void*) = nullptr;
+  void(__cdecl* frame_destroy)(void*) = nullptr;
+  void(__cdecl* tab_frame_copy)(void*, const void*) = nullptr;
+  void(__cdecl* tab_frame_destroy)(void*) = nullptr;
+  void(__cdecl* tab_base_copy)(void*, const void*) = nullptr;
+  void(__cdecl* tab_base_destroy)(void*) = nullptr;
+  ToolbarTitleDrawFn proxy_primitive = nullptr;
+};
+
+ModernWorkspacePaintApi g_modern_workspace_paint_api;
+std::vector<VcbStatusPaintHook> g_modern_workspace_color_hooks;
+VcbStatusPaintHook g_modern_workspace_primitive_hook;
+struct ModernWorkspacePaintContext {
+  void* painter = nullptr;
+  int control = -1;
+  unsigned int state = 0;
+  int primitive = -1;
+};
+thread_local ModernWorkspacePaintContext g_modern_workspace_paint;
+
+bool resolve_modern_workspace_paint_api() {
+  auto& api = g_modern_workspace_paint_api;
+  HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  HMODULE widgets = GetModuleHandleW(L"Qt6Widgets.dll");
+  api.brush_color = reinterpret_cast<decltype(api.brush_color)>(
+    GetProcAddress(gui, "?setBrush@QPainter@@QEAAXVQColor@@@Z"));
+  api.brush_ctor = reinterpret_cast<decltype(api.brush_ctor)>(
+    GetProcAddress(gui, "??0QBrush@@QEAA@AEBVQColor@@W4BrushStyle@Qt@@@Z"));
+  api.fill_rect = reinterpret_cast<decltype(api.fill_rect)>(
+    GetProcAddress(gui, "?fillRect@QPainter@@QEAAXAEBVQRect@@AEBVQColor@@@Z"));
+  api.pen_ctor = reinterpret_cast<decltype(api.pen_ctor)>(GetProcAddress(gui, "??0QPen@@QEAA@AEBVQColor@@@Z"));
+  api.rgba = reinterpret_cast<decltype(api.rgba)>(GetProcAddress(gui, "?rgba@QColor@@QEBAIXZ"));
+  api.tab_copy = reinterpret_cast<decltype(api.tab_copy)>(
+    GetProcAddress(widgets, "??0QStyleOptionTab@@QEAA@AEBV0@@Z"));
+  api.tab_destroy = reinterpret_cast<decltype(api.tab_destroy)>(
+    GetProcAddress(widgets, "??1QStyleOptionTab@@QEAA@XZ"));
+  api.dock_copy = reinterpret_cast<decltype(api.dock_copy)>(
+    GetProcAddress(widgets, "??0QStyleOptionDockWidget@@QEAA@AEBV0@@Z"));
+  api.dock_destroy = reinterpret_cast<decltype(api.dock_destroy)>(
+    GetProcAddress(widgets, "??1QStyleOptionDockWidget@@QEAA@XZ"));
+  api.palette_key = reinterpret_cast<decltype(api.palette_key)>(
+    GetProcAddress(gui, "?cacheKey@QPalette@@QEBA_JXZ"));
+  api.palette_mask = reinterpret_cast<decltype(api.palette_mask)>(
+    GetProcAddress(gui, "?resolveMask@QPalette@@QEBA_KXZ"));
+  api.palette_group = reinterpret_cast<decltype(api.palette_group)>(
+    GetProcAddress(gui, "?currentColorGroup@QPalette@@QEBA?AW4ColorGroup@1@XZ"));
+  api.palette_assign = reinterpret_cast<decltype(api.palette_assign)>(
+    GetProcAddress(gui, "??4QPalette@@QEAAAEAV0@AEBV0@@Z"));
+  api.cursor_pos = reinterpret_cast<decltype(api.cursor_pos)>(GetProcAddress(gui, "?pos@QCursor@@SA?AVQPoint@@XZ"));
+  api.map_from_global = reinterpret_cast<decltype(api.map_from_global)>(
+    GetProcAddress(widgets, "?mapFromGlobal@QWidget@@QEBA?AVQPoint@@AEBV2@@Z"));
+  api.option_copy = reinterpret_cast<decltype(api.option_copy)>(GetProcAddress(widgets, "??0QStyleOption@@QEAA@AEBV0@@Z"));
+  api.option_destroy = reinterpret_cast<decltype(api.option_destroy)>(GetProcAddress(widgets, "??1QStyleOption@@QEAA@XZ"));
+  api.frame_copy = reinterpret_cast<decltype(api.frame_copy)>(GetProcAddress(widgets, "??0QStyleOptionFrame@@QEAA@AEBV0@@Z"));
+  api.frame_destroy = reinterpret_cast<decltype(api.frame_destroy)>(GetProcAddress(widgets, "??1QStyleOptionFrame@@QEAA@XZ"));
+  api.tab_frame_copy = reinterpret_cast<decltype(api.tab_frame_copy)>(GetProcAddress(widgets, "??0QStyleOptionTabWidgetFrame@@QEAA@AEBV0@@Z"));
+  api.tab_frame_destroy = reinterpret_cast<decltype(api.tab_frame_destroy)>(GetProcAddress(widgets, "??1QStyleOptionTabWidgetFrame@@QEAA@XZ"));
+  api.tab_base_copy = reinterpret_cast<decltype(api.tab_base_copy)>(GetProcAddress(widgets, "??0QStyleOptionTabBarBase@@QEAA@AEBV0@@Z"));
+  api.tab_base_destroy = reinterpret_cast<decltype(api.tab_base_destroy)>(GetProcAddress(widgets, "??1QStyleOptionTabBarBase@@QEAA@XZ"));
+  api.proxy_primitive = reinterpret_cast<ToolbarTitleDrawFn>(GetProcAddress(widgets,
+    "?drawPrimitive@QProxyStyle@@UEBAXW4PrimitiveElement@QStyle@@PEBVQStyleOption@@PEAVQPainter@@PEBVQWidget@@@Z"));
+  return api.brush_color && api.brush_ctor && api.fill_rect && api.pen_ctor && api.rgba && api.tab_copy && api.tab_destroy &&
+    api.dock_copy && api.dock_destroy;
+}
+
+struct ModernWorkspacePaletteEntry {
+  alignas(16) unsigned char palette[256] = {};
+  long long key = 0;
+  unsigned long long mask = 0;
+  int group = 0;
+  bool constructed = false;
+};
+
+constexpr size_t modern_workspace_palette_capacity = 16;
+ModernWorkspacePaletteEntry g_modern_workspace_palettes[modern_workspace_palette_capacity];
+size_t g_modern_workspace_palette_next = 0;
+
+void clear_modern_workspace_palettes(const QtLookup& lookup) {
+  for (auto& entry : g_modern_workspace_palettes) {
+    if (entry.constructed) {
+      reinterpret_cast<void(__cdecl*)(void*)>(lookup.qpalette_destructor_proc)(entry.palette);
+      entry.constructed = false;
+    }
+  }
+  g_modern_workspace_palette_next = 0;
+}
+
+void apply_modern_workspace_paint_palette(const QtLookup& lookup, void* palette) {
+  const auto& api = g_modern_workspace_paint_api;
+  const bool cache_available = api.palette_key && api.palette_mask && api.palette_group && api.palette_assign &&
+    lookup.qpalette_copy_ctor_proc && lookup.qpalette_destructor_proc;
+  const long long key = cache_available ? api.palette_key(palette) : 0;
+  const unsigned long long mask = cache_available ? api.palette_mask(palette) : 0;
+  const int group = cache_available ? api.palette_group(palette) : 0;
+  if (cache_available) {
+    for (const auto& entry : g_modern_workspace_palettes) {
+      if (entry.constructed && entry.key == key && entry.mask == mask && entry.group == group) {
+        api.palette_assign(palette, entry.palette);
+        return;
+      }
+    }
+  }
+  apply_blender_palette_roles(lookup, palette);
+  for (int role : {0, 6, 8}) {
+    set_qpalette_role_color(lookup, palette, {role, 216, 219, 226});
+    set_qpalette_color_group_role_color(lookup, palette, 1, {role, 142, 147, 155});
+  }
+  if (cache_available) {
+    auto& entry = g_modern_workspace_palettes[g_modern_workspace_palette_next];
+    if (entry.constructed) {
+      reinterpret_cast<void(__cdecl*)(void*)>(lookup.qpalette_destructor_proc)(entry.palette);
+    }
+    reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.qpalette_copy_ctor_proc)(entry.palette, palette);
+    entry.key = key;
+    entry.mask = mask;
+    entry.group = group;
+    entry.constructed = true;
+    g_modern_workspace_palette_next = (g_modern_workspace_palette_next + 1) % modern_workspace_palette_capacity;
+  }
+}
+
+const void* modern_workspace_paint_color(const void* color, void* replacement, bool foreground) {
+  if (!g_modern_workspace_paint.painter || !color || !g_modern_workspace_paint_api.rgba) {
+    return color;
+  }
+  const unsigned int rgba = g_modern_workspace_paint_api.rgba(color);
+  const unsigned int rgb = rgba & 0xffffff;
+  const unsigned int shade = (rgb >> 16) & 255;
+  const bool neutral = ((rgb >> 8) & 255) == shade && (rgb & 255) == shade;
+  const bool native_blue = rgb == 0x0e416c || rgb == 0x009ad9 || rgb == 0x0063a3;
+  const bool native_tab_background = g_modern_workspace_paint.control == 8 && rgb == 0xe0e1e9;
+  if ((foreground && !neutral && !native_blue) ||
+      (!foreground && !native_tab_background && (!neutral || shade < 128))) {
+    return color;
+  }
+  int red = 48;
+  int green = 48;
+  int blue = 48;
+  if (foreground) {
+    const bool enabled = (g_modern_workspace_paint.state & 1) != 0;
+    red = enabled ? 216 : 142;
+    green = enabled ? 219 : 147;
+    blue = enabled ? 226 : 155;
+  } else if (g_modern_workspace_paint.control != 30) {
+    red = green = blue = (g_modern_workspace_paint.state & 0x8000) ? 69 :
+      (g_modern_workspace_paint.state & 0x2000) ? 58 : 48;
+  }
+  reinterpret_cast<QtColorRgbCtorFn>(resolve_qt_lookup().qcolor_rgb_ctor_proc)(
+    replacement, red, green, blue, rgba >> 24);
+  return replacement;
+}
+
+void __cdecl modern_workspace_brush_color_hook(void* painter, const void* color) {
+  alignas(16) unsigned char replacement[64] = {};
+  g_modern_workspace_paint_api.brush_color(painter,
+    painter == g_modern_workspace_paint.painter && g_modern_workspace_paint.control == 8
+      ? modern_workspace_paint_color(color, replacement, false) : color);
+}
+
+void __cdecl modern_workspace_brush_ctor_hook(void* brush, const void* color, int style) {
+  alignas(16) unsigned char replacement[64] = {};
+  g_modern_workspace_paint_api.brush_ctor(brush,
+    g_modern_workspace_paint.control == 9 ? modern_workspace_paint_color(color, replacement, true) : color, style);
+}
+
+void __cdecl modern_workspace_fill_rect_hook(void* painter, const void* rect, const void* color) {
+  alignas(16) unsigned char replacement[64] = {};
+  const bool selected_underline = g_modern_workspace_paint.control == 8 && color &&
+    (g_modern_workspace_paint_api.rgba(color) & 0xffffff) == 0x0063a3;
+  g_modern_workspace_paint_api.fill_rect(painter, rect,
+    painter == g_modern_workspace_paint.painter && (g_modern_workspace_paint.control == 30 || selected_underline)
+      ? modern_workspace_paint_color(color, replacement, selected_underline) : color);
+}
+
+void __cdecl modern_workspace_primitive_pen_hook(void* pen, const void* color) {
+  alignas(16) unsigned char replacement[64] = {};
+  if (g_modern_workspace_dark && g_modern_workspace_paint.painter &&
+      g_modern_workspace_paint.primitive >= 0 && color) {
+    const unsigned int rgba = g_modern_workspace_paint_api.rgba(color);
+    const unsigned int shade = (rgba >> 16) & 255;
+    if (((rgba >> 8) & 255) == shade && (rgba & 255) == shade && shade >= 96) {
+      reinterpret_cast<QtColorRgbCtorFn>(resolve_qt_lookup().qcolor_rgb_ctor_proc)(replacement, 58, 58, 58, rgba >> 24);
+      color = replacement;
+    }
+  }
+  g_modern_workspace_paint_api.pen_ctor(pen, color);
+}
+
+bool set_modern_workspace_color_hooks(bool enabled, HMODULE module = nullptr) {
+  if (!enabled) {
+    for (auto hook = g_modern_workspace_color_hooks.begin(); hook != g_modern_workspace_color_hooks.end();) {
+      const void* current = *hook->slot;
+      if (current == reinterpret_cast<void*>(&modern_workspace_brush_color_hook) ||
+          current == reinterpret_cast<void*>(&modern_workspace_brush_ctor_hook) ||
+          current == reinterpret_cast<void*>(&modern_workspace_fill_rect_hook) ||
+          current == reinterpret_cast<void*>(&modern_workspace_primitive_pen_hook)) {
+        DWORD protection = 0;
+        if (!VirtualProtect(hook->slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+          ++hook;
+          continue;
+        }
+        *hook->slot = hook->original_proc;
+        DWORD unused = 0;
+        VirtualProtect(hook->slot, sizeof(void*), protection, &unused);
+      }
+      hook = g_modern_workspace_color_hooks.erase(hook);
+    }
+    return g_modern_workspace_color_hooks.empty();
+  }
+  if (!g_modern_workspace_color_hooks.empty()) {
+    return true;
+  }
+  if (!resolve_modern_workspace_paint_api()) {
+    return false;
+  }
+  const std::pair<void*, void*> replacements[] = {
+    {reinterpret_cast<void*>(g_modern_workspace_paint_api.brush_color), reinterpret_cast<void*>(&modern_workspace_brush_color_hook)},
+    {reinterpret_cast<void*>(g_modern_workspace_paint_api.brush_ctor), reinterpret_cast<void*>(&modern_workspace_brush_ctor_hook)},
+    {reinterpret_cast<void*>(g_modern_workspace_paint_api.fill_rect), reinterpret_cast<void*>(&modern_workspace_fill_rect_hook)},
+    {reinterpret_cast<void*>(g_modern_workspace_paint_api.pen_ctor), reinterpret_cast<void*>(&modern_workspace_primitive_pen_hook)}
+  };
+  for (const auto& replacement : replacements) {
+    const auto slots = find_main_import_iat_slots_for_target(replacement.first, module ? module : GetModuleHandleW(nullptr));
+    if (slots.empty()) {
+      static_cast<void>(set_modern_workspace_color_hooks(false));
+      return false;
+    }
+    for (void** slot : slots) {
+      DWORD protection = 0;
+      if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+        static_cast<void>(set_modern_workspace_color_hooks(false));
+        return false;
+      }
+      g_modern_workspace_color_hooks.push_back({slot, *slot});
+      *slot = replacement.second;
+      DWORD unused = 0;
+      VirtualProtect(slot, sizeof(void*), protection, &unused);
+    }
+  }
+  return true;
+}
+
+bool draw_modern_workspace_control(const QtLookup& lookup, const void* style, int control, const void* option,
+                                  void* painter, const void* widget, ToolbarTitleDrawFn original) {
+  if (!g_modern_workspace_dark || !widget || !painter || !original ||
+      (control != 8 && control != 9 && control != 30) || !g_modern_workspace_paint_api.tab_copy ||
+      !memory_readable(option, 64) ||
+      (g_modern_workspace_paint.painter == painter && g_modern_workspace_paint.control == control)) {
+    return false;
+  }
+  const auto surface = modern_workspace_surface(lookup, widget, modern_workspace_types());
+  const auto* source = static_cast<const Qt6DockTitleOptionView*>(option);
+  const bool title = control == 30;
+  if (surface == ModernWorkspaceSurface::None ||
+      (title ? surface != ModernWorkspaceSurface::TrayTitle || source->type != 9 || source->version != 1 :
+        source->type != 3 || source->version != 1 || !qt_object_inherits(lookup, widget, "QTabBar"))) {
+    return false;
+  }
+  alignas(16) unsigned char storage[512] = {};
+  const auto& api = g_modern_workspace_paint_api;
+  (title ? api.dock_copy : api.tab_copy)(storage, option);
+  auto* themed = reinterpret_cast<Qt6DockTitleOptionView*>(storage);
+  apply_modern_workspace_paint_palette(lookup, themed->palette);
+  const auto previous = g_modern_workspace_paint;
+  g_modern_workspace_paint = {painter, control, source->state};
+  InterlockedIncrement(title ? &g_modern_workspace_title_draws : &g_modern_workspace_tab_draws);
+  if (control == 8 && surface == ModernWorkspaceSurface::Tabs) {
+    const void* owner = qwidget_parent_widget(lookup, const_cast<void*>(widget));
+    for (int depth = 0; owner && depth < 16 && pointer_looks_like_cpp_object(owner); ++depth) {
+      const void* owner_table = *static_cast<const void* const*>(owner);
+      const auto& types = modern_workspace_types();
+      if (std::any_of(types.begin(), types.end(), [owner_table](const ModernWorkspaceType& type) {
+          return type.scene_tabs && type.vtable == owner_table;
+        })) {
+        alignas(16) unsigned char background[64] = {};
+        reinterpret_cast<QtColorRgbCtorFn>(lookup.qcolor_rgb_ctor_proc)(background, 43, 43, 43, 255);
+        api.fill_rect(painter, source->rect, background);
+        break;
+      }
+      owner = qwidget_parent_widget(lookup, const_cast<void*>(owner));
+    }
+  }
+  original(style, control, storage, painter, widget);
+  g_modern_workspace_paint = previous;
+  (title ? api.dock_destroy : api.tab_destroy)(storage);
+  return true;
+}
+
+void __cdecl modern_workspace_primitive_draw_hook(const void* style, int primitive, const void* option,
+                                                void* painter, const void* widget) {
+  const auto original = reinterpret_cast<ToolbarTitleDrawFn>(g_modern_workspace_primitive_hook.original_proc);
+  if (!original) {
+    return;
+  }
+  const auto& api = g_modern_workspace_paint_api;
+  const auto* source = static_cast<const Qt6DockTitleOptionView*>(option);
+    if (g_modern_workspace_dark && (primitive == 0 || primitive == 2 || primitive == 8) &&
+      painter && widget && memory_readable(option, 64) &&
+      !(g_modern_workspace_paint.painter == painter && g_modern_workspace_paint.primitive == primitive)) {
+    const auto surface = modern_workspace_surface(resolve_qt_lookup(), widget, modern_workspace_types());
+    const bool relevant = primitive != 12 &&
+      (surface == ModernWorkspaceSurface::TrayFrame || surface == ModernWorkspaceSurface::TrayTitle);
+    void(__cdecl* copy)(void*, const void*) = nullptr;
+    void(__cdecl* destroy)(void*) = nullptr;
+    if (source->type == 0 && source->version == 1) {
+      copy = api.option_copy;
+      destroy = api.option_destroy;
+    } else if (source->type == 5 && source->version >= 1 && source->version <= 3) {
+      copy = api.frame_copy;
+      destroy = api.frame_destroy;
+    } else if (source->type == 9 && source->version == 1) {
+      copy = api.dock_copy;
+      destroy = api.dock_destroy;
+    } else if (source->type == 11 && source->version == 1) {
+      copy = api.tab_frame_copy;
+      destroy = api.tab_frame_destroy;
+    } else if (source->type == 12 && source->version >= 1 && source->version <= 2) {
+      copy = api.tab_base_copy;
+      destroy = api.tab_base_destroy;
+    }
+    if (relevant && copy && destroy) {
+      alignas(16) unsigned char storage[512] = {};
+      copy(storage, option);
+      apply_modern_workspace_paint_palette(resolve_qt_lookup(), reinterpret_cast<Qt6DockTitleOptionView*>(storage)->palette);
+      const auto previous = g_modern_workspace_paint;
+      g_modern_workspace_paint = {painter, -1, source->state, primitive};
+      original(style, primitive, storage, painter, widget);
+      g_modern_workspace_paint = previous;
+      destroy(storage);
+      return;
+    }
+  }
+  if (g_modern_workspace_dark && primitive == 47 && painter && widget && memory_readable(option, 64) &&
+      source->version == 1 && source->type == 0 && !(source->state & 4) &&
+      api.cursor_pos && api.map_from_global && api.option_copy && api.option_destroy && api.proxy_primitive &&
+      modern_workspace_surface(resolve_qt_lookup(), widget, modern_workspace_types()) == ModernWorkspaceSurface::Tabs &&
+      source->rect[2] >= source->rect[0] && source->rect[3] >= source->rect[1]) {
+    int global[2] = {};
+    int local[2] = {};
+    api.cursor_pos(global);
+    api.map_from_global(widget, local, global);
+    const bool inside = local[0] >= source->rect[0] && local[0] <= source->rect[2] &&
+      local[1] >= source->rect[1] && local[1] <= source->rect[3];
+    if (!inside) {
+      alignas(16) unsigned char storage[128] = {};
+      api.option_copy(storage, option);
+      reinterpret_cast<Qt6DockTitleOptionView*>(storage)->state &= ~(0x2000u | 2u);
+      api.proxy_primitive(style, primitive, storage, painter, widget);
+      api.option_destroy(storage);
+      return;
+    }
+  }
+  original(style, primitive, option, painter, widget);
+}
+
+bool set_modern_workspace_primitive_hook(bool enabled, void** slot = nullptr) {
+  auto& hook = g_modern_workspace_primitive_hook;
+  if (!enabled) {
+    if (hook.slot && *hook.slot == reinterpret_cast<void*>(&modern_workspace_primitive_draw_hook)) {
+      DWORD protection = 0;
+      if (!VirtualProtect(hook.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+        return false;
+      }
+      *hook.slot = hook.original_proc;
+      DWORD unused = 0;
+      VirtualProtect(hook.slot, sizeof(void*), protection, &unused);
+    }
+    hook = {};
+    return true;
+  }
+  if (hook.slot) {
+    return hook.slot == slot && *slot == reinterpret_cast<void*>(&modern_workspace_primitive_draw_hook);
+  }
+  DWORD protection = 0;
+  if (!memory_readable(slot, sizeof(void*)) || !*slot ||
+      !VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  hook = {slot, *slot};
+  *slot = reinterpret_cast<void*>(&modern_workspace_primitive_draw_hook);
+  DWORD unused = 0;
+  VirtualProtect(slot, sizeof(void*), protection, &unused);
+  return true;
+}
+
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_workspace_style_preparations = 0;
+#endif
+
+bool apply_modern_workspace_widget_style(const QtLookup& lookup, void* widget, bool dark,
+                                        ModernWorkspaceSurface explicit_surface = ModernWorkspaceSurface::None) {
+  const auto surface = explicit_surface == ModernWorkspaceSurface::None ?
+    modern_workspace_surface(lookup, widget, modern_workspace_types()) : explicit_surface;
+  if (!widget || (dark && surface == ModernWorkspaceSurface::None) || g_modern_workspace_style_applying ||
+      !lookup.widget_palette_proc || !lookup.qpalette_copy_ctor_proc || !lookup.qpalette_destructor_proc ||
+      !lookup.widget_set_palette_proc || !lookup.from_utf8_proc || !lookup.widget_set_stylesheet_proc) {
+    return false;
+  }
+  const auto& property_api = widget_theme_api();
+  const auto property = property_api.property;
+  const auto set_property = property_api.set_property;
+  const auto variant_destroy = property_api.variant_destroy;
+  const auto variant_default = property_api.variant_default;
+  const auto variant_bytes = property_api.variant_bytes;
+  const auto bytes_ctor = property_api.bytes_ctor;
+  const auto to_bytes = property_api.to_bytes;
+  const auto type_name = property_api.type_name;
+  const auto variant_data = property_api.variant_data;
+  const auto palette_variant = property_api.palette_variant;
+  if (!property || !set_property || !variant_destroy || !variant_default || !variant_bytes || !bytes_ctor ||
+      !to_bytes || !type_name || !variant_data || !palette_variant) {
+    return false;
+  }
+  std::string current;
+  if (!read_omnibar_stylesheet(lookup, widget, current)) {
+    return false;
+  }
+  constexpr const char* palette_key = "_darkmode_workspace_native_palette";
+  constexpr const char* native_key = "_darkmode_workspace_native_qss";
+  constexpr const char* themed_key = "_darkmode_workspace_themed_qss";
+  const auto get_text = [&](const char* name) {
+    alignas(16) unsigned char value[64] = {};
+    alignas(16) unsigned char bytes[64] = {};
+    property(widget, value, name);
+    to_bytes(value, bytes);
+    const long long size = reinterpret_cast<long long(__cdecl*)(const void*)>(lookup.qbytearray_size_proc)(bytes);
+    const char* data = reinterpret_cast<const char*(__cdecl*)(const void*)>(lookup.qbytearray_const_data_proc)(bytes);
+    std::string text;
+    if (size > 0 && size <= 1024 * 1024 && data && memory_readable(data, static_cast<size_t>(size))) {
+      text.assign(data, static_cast<size_t>(size));
+    }
+    reinterpret_cast<void(__cdecl*)(void*)>(lookup.qbytearray_destructor_proc)(bytes);
+    variant_destroy(value);
+    return text;
+  };
+  const auto set_text = [&](const char* name, const std::string& text) {
+    alignas(16) unsigned char bytes[64] = {};
+    alignas(16) unsigned char value[64] = {};
+    bytes_ctor(bytes, text.data(), static_cast<long long>(text.size()));
+    variant_bytes(value, bytes);
+    set_property(widget, name, value);
+    variant_destroy(value);
+    reinterpret_cast<void(__cdecl*)(void*)>(lookup.qbytearray_destructor_proc)(bytes);
+  };
+  const auto set_stylesheet = [&](const std::string& text) {
+    alignas(16) unsigned char string[64] = {};
+    reinterpret_cast<void(__cdecl*)(void*, const char*, long long)>(lookup.from_utf8_proc)(
+      string, text.data(), static_cast<long long>(text.size()));
+    reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.widget_set_stylesheet_proc)(widget, string);
+    reinterpret_cast<void(__cdecl*)(void*)>(lookup.qstring_destructor_proc)(string);
+  };
+  alignas(16) unsigned char original[64] = {};
+  property(widget, original, palette_key);
+  const char* original_type = type_name(original);
+  const bool saved = original_type && std::strcmp(original_type, "QPalette") == 0;
+  constexpr const char* stamp_key = "_darkmode_workspace_stamp";
+  if (dark && saved && current == get_text(themed_key) &&
+      widget_theme_stamp(lookup, widget, stamp_key, false, qwidget_style(lookup, widget),
+        qwidget_parent_widget(lookup, widget), static_cast<size_t>(surface))) {
+    variant_destroy(original);
+    return true;
+  }
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_workspace_style_preparations;
+#endif
+  g_modern_workspace_style_applying = true;
+  const auto refresh_style = [&](size_t slot) {
+    void* style = qwidget_style(lookup, widget);
+    if (style && lookup.object_inherits_proc &&
+        reinterpret_cast<bool(__cdecl*)(const void*, const char*)>(lookup.object_inherits_proc)(style, "QStyleSheetStyle")) {
+      auto* methods = *static_cast<void***>(style);
+      if (memory_readable(methods, (slot + 1) * sizeof(void*))) {
+        reinterpret_cast<void(__cdecl*)(void*, void*)>(methods[slot])(style, widget);
+      }
+    }
+  };
+  constexpr size_t widget_unpolish_slot = 15;
+  constexpr size_t widget_polish_slot = 13;
+  if (dark || saved) {
+    refresh_style(widget_unpolish_slot);
+  }
+  if (dark) {
+    if (!saved) {
+      variant_destroy(original);
+      const void* palette = reinterpret_cast<const void*(__cdecl*)(const void*)>(lookup.widget_palette_proc)(widget);
+      palette_variant(palette, original);
+      set_property(widget, palette_key, original);
+      set_text(native_key, current);
+    } else if (current != get_text(themed_key)) {
+      set_text(native_key, current);
+    }
+    const std::string themed = recolor_modern_workspace_stylesheet(get_text(native_key), surface);
+    set_text(themed_key, themed);
+    alignas(16) unsigned char palette[256] = {};
+    reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.qpalette_copy_ctor_proc)(palette, variant_data(original));
+    apply_blender_palette_roles(lookup, palette);
+    for (int role : {0, 6, 8}) {
+      set_qpalette_role_color(lookup, palette, {role, 216, 219, 226});
+      set_qpalette_color_group_role_color(lookup, palette, 1, {role, 142, 147, 155});
+    }
+    reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.widget_set_palette_proc)(widget, palette);
+    reinterpret_cast<void(__cdecl*)(void*)>(lookup.qpalette_destructor_proc)(palette);
+    if (current != themed) {
+      set_stylesheet(themed);
+    }
+    refresh_style(widget_polish_slot);
+    if (surface == ModernWorkspaceSurface::TrayTitle || qt_object_inherits(lookup, widget, "QTabBar")) {
+      static_cast<void>(install_style_control_hook(lookup, widget));
+    }
+    widget_theme_stamp(lookup, widget, stamp_key, true, qwidget_style(lookup, widget),
+      qwidget_parent_widget(lookup, widget), static_cast<size_t>(surface));
+  } else {
+    if (saved) {
+      reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.widget_set_palette_proc)(widget, variant_data(original));
+      if (current == get_text(themed_key)) {
+        set_stylesheet(get_text(native_key));
+      }
+      refresh_style(widget_polish_slot);
+      alignas(16) unsigned char empty[64] = {};
+      variant_default(empty);
+      for (const char* name : {palette_key, native_key, themed_key, stamp_key}) {
+        set_property(widget, name, empty);
+      }
+      variant_destroy(empty);
+    }
+  }
+  variant_destroy(original);
+  g_modern_workspace_style_applying = false;
+  return true;
+}
+
+size_t apply_notification_style(const QtLookup& lookup, void* widget, bool dark, const void* expected) {
+  if (!expected || !pointer_looks_like_cpp_object(widget) ||
+      *reinterpret_cast<const void* const*>(widget) != expected) {
+    return 0;
+  }
+  std::vector<void*> widgets;
+  std::unordered_set<std::uintptr_t> visited;
+  collect_qwidget_descendants_from_qobject(lookup, widget, 0, 32, widgets, 65536, visited, "Notification", true);
+  add_unique_pointer(widgets, widget);
+  size_t applied = 0;
+  for (void* child : widgets) {
+    applied += apply_modern_workspace_widget_style(lookup, child, dark, ModernWorkspaceSurface::Notification) ? 1 : 0;
+  }
+  return applied;
+}
+
+size_t apply_existing_notification_styles(const QtLookup& lookup, bool dark) {
+  if (!lookup.app_all_widgets_proc) {
+    return 0;
+  }
+  std::vector<void*> widgets;
+  static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, static_cast<size_t>(-1)));
+  size_t applied = 0;
+  for (void* widget : widgets) {
+    applied += apply_notification_style(lookup, widget, dark);
+  }
+  return applied;
+}
+
+void __cdecl modern_workspace_stylesheet_hook(void* widget, const void* stylesheet) {
+  const QtLookup& lookup = resolve_qt_lookup();
+  reinterpret_cast<void(__cdecl*)(void*, const void*)>(lookup.widget_set_stylesheet_proc)(widget, stylesheet);
+  if (g_modern_workspace_dark && !g_modern_workspace_style_applying) {
+    static_cast<void>(apply_modern_workspace_widget_style(lookup, widget, true));
+  }
+}
+
+void __cdecl modern_workspace_show_hook(void* widget) {
+  const QtLookup& lookup = resolve_qt_lookup();
+  if (g_modern_workspace_dark && !g_modern_workspace_style_applying &&
+      modern_workspace_surface(lookup, widget, modern_workspace_types()) != ModernWorkspaceSurface::None) {
+    std::vector<void*> widgets;
+    std::unordered_set<std::uintptr_t> visited;
+    collect_qwidget_descendants_from_qobject(lookup, widget, 0, 32, widgets, 65536, visited, "Workspace show", true);
+    for (void* child : widgets) {
+      static_cast<void>(apply_modern_workspace_widget_style(lookup, child, true));
+    }
+  }
+  static const auto original = reinterpret_cast<void(__cdecl*)(void*)>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Widgets.dll"), "?show@QWidget@@QEAAXXZ"));
+  if (original) {
+    original(widget);
+  }
+}
+
+#if defined(DARKMODE_RUNTIME_TESTING)
+HMODULE g_test_modern_workspace_setup_module = nullptr;
+#endif
+
+bool set_modern_workspace_style_hook(const QtLookup& lookup, bool enabled, HMODULE module = nullptr) {
+  module = module ? module : GetModuleHandleW(nullptr);
+#if defined(DARKMODE_RUNTIME_TESTING)
+  g_test_modern_workspace_setup_module = module;
+#endif
+  g_modern_workspace_dark = enabled;
+  if (!enabled) {
+    clear_modern_workspace_palettes(lookup);
+    const bool primitives_removed = set_modern_workspace_primitive_hook(false);
+    const bool frame_removed = set_modern_workspace_frame_hook(false);
+    const bool colors_removed = set_modern_workspace_color_hooks(false);
+    for (auto hook = g_modern_workspace_style_hooks.begin(); hook != g_modern_workspace_style_hooks.end();) {
+        if (*hook->slot == reinterpret_cast<void*>(&modern_workspace_stylesheet_hook) ||
+          *hook->slot == reinterpret_cast<void*>(&modern_workspace_show_hook)) {
+        DWORD protection = 0;
+        if (!VirtualProtect(hook->slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+          ++hook;
+          continue;
+        }
+        *hook->slot = hook->original_proc;
+        DWORD unused = 0;
+        VirtualProtect(hook->slot, sizeof(void*), protection, &unused);
+      }
+      hook = g_modern_workspace_style_hooks.erase(hook);
+    }
+    return primitives_removed && frame_removed && colors_removed && g_modern_workspace_style_hooks.empty();
+  }
+  if (modern_workspace_types().empty()) {
+    return true;
+  }
+  if (!set_modern_workspace_color_hooks(true, module)) {
+    return false;
+  }
+  static_cast<void>(set_modern_workspace_frame_hook(true));
+  const auto* proxy_table = static_cast<const void* const*>(primary_rtti_vtable(
+    find_vtables_for_type(".?AVSketchUpProxyStyle@@", module)));
+  if (!memory_readable(proxy_table, 23 * sizeof(void*)) ||
+      !install_style_control_slot(const_cast<void**>(proxy_table + 22))) {
+    static_cast<void>(set_modern_workspace_primitive_hook(false));
+    static_cast<void>(set_modern_workspace_frame_hook(false));
+    static_cast<void>(set_modern_workspace_color_hooks(false));
+    return false;
+  }
+  static_cast<void>(set_modern_workspace_primitive_hook(true, const_cast<void**>(proxy_table + 21)));
+  if (!g_modern_workspace_style_hooks.empty()) {
+    return std::all_of(g_modern_workspace_style_hooks.begin(), g_modern_workspace_style_hooks.end(),
+      [&lookup](const VcbStatusPaintHook& hook) {
+        const void* expected = hook.original_proc == reinterpret_cast<void*>(lookup.widget_set_stylesheet_proc)
+          ? reinterpret_cast<void*>(&modern_workspace_stylesheet_hook) : reinterpret_cast<void*>(&modern_workspace_show_hook);
+        return *hook.slot == expected;
+      });
+  }
+  const std::pair<void*, void*> hooks[] = {
+    {reinterpret_cast<void*>(lookup.widget_set_stylesheet_proc), reinterpret_cast<void*>(&modern_workspace_stylesheet_hook)},
+    {reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"Qt6Widgets.dll"), "?show@QWidget@@QEAAXXZ")),
+      reinterpret_cast<void*>(&modern_workspace_show_hook)}
+  };
+  for (const auto& replacement : hooks) {
+    const auto slots = find_main_import_iat_slots_for_target(replacement.first, module);
+    for (void** slot : slots) {
+      DWORD protection = 0;
+      if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+        static_cast<void>(set_modern_workspace_style_hook(lookup, false));
+        return false;
+      }
+      g_modern_workspace_style_hooks.push_back({slot, *slot});
+      *slot = replacement.second;
+      DWORD unused = 0;
+      VirtualProtect(slot, sizeof(void*), protection, &unused);
+    }
+  }
+  return !g_modern_workspace_style_hooks.empty();
+}
+
+size_t apply_modern_workspace_styles(const QtLookup& lookup, bool dark) {
+  if (modern_workspace_types().empty() || !lookup.app_all_widgets_proc) {
+    return 0;
+  }
+  std::vector<void*> widgets;
+  static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, static_cast<size_t>(-1)));
+  size_t applied = 0;
+  for (void* widget : widgets) {
+    applied += apply_modern_workspace_widget_style(lookup, widget, dark) ? 1 : 0;
+  }
+  return applied;
+}
+
 std::vector<void**> find_main_import_iat_slots_for_symbols(const std::vector<std::string>& target_symbols) {
   std::vector<void**> slots;
   if (target_symbols.empty()) {
@@ -5633,30 +6695,6 @@ bool icon_theme_enabled() {
   return InterlockedCompareExchange(&g_icon_theme_enabled, 0, 0) != 0;
 }
 
-void write_icon_theme_status(const char* phase) {
-  if (g_icon_theme_status_path.empty()) {
-    return;
-  }
-
-  std::lock_guard<std::mutex> lock(g_icon_theme_status_mutex);
-  std::ofstream output(g_icon_theme_status_path, std::ios::trunc);
-  if (!output) {
-    return;
-  }
-  output << "phase=" << (phase ? phase : "unknown") << '\n';
-  output << "enabled=" << (icon_theme_enabled() ? 1 : 0) << '\n';
-  output << "resource-colors=" << InterlockedCompareExchange(&g_icon_theme_resource_color_count, 0, 0) << '\n';
-  output << "chevron-resource-colors=" << InterlockedCompareExchange(&g_icon_theme_chevron_resource_color_count, 0, 0) << '\n';
-  output << "default-env-colors=" << InterlockedCompareExchange(&g_icon_theme_default_env_color_count, 0, 0) << '\n';
-  output << "tray-chevron-pixmaps=" << InterlockedCompareExchange(&g_icon_theme_tray_chevron_pixmap_count, 0, 0) << '\n';
-  output << "tray-chevron-widgets=" << InterlockedCompareExchange(&g_icon_theme_tray_chevron_widget_count, 0, 0) << '\n';
-  output << "tray-chevron-headers=" << InterlockedCompareExchange(&g_icon_theme_tray_chevron_header_count, 0, 0) << '\n';
-  output << "tray-hide-native-patches=" << InterlockedCompareExchange(&g_icon_theme_tray_hide_native_patch_count, 0, 0) << '\n';
-  output << "tray-hide-native-rebuilds=" << InterlockedCompareExchange(&g_icon_theme_tray_hide_native_rebuild_count, 0, 0) << '\n';
-  output << "component-navigator-search-icons=" << InterlockedCompareExchange(&g_icon_theme_component_navigator_search_icon_count, 0, 0) << '\n';
-  output << "page-tabs-search-icons=" << InterlockedCompareExchange(&g_icon_theme_page_tabs_search_icon_count, 0, 0) << '\n';
-}
-
 bool is_svg_hex_digit(unsigned char value) {
   return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F');
 }
@@ -5718,7 +6756,10 @@ bool has_only_black_svg_color(const unsigned char* svg_begin, size_t svg_size) {
   return found_black;
 }
 
-const char* svg_icon_theme_replacement(const unsigned char* color, bool replace_black) {
+const char* svg_icon_theme_replacement(const unsigned char* color, bool replace_black, bool monochrome_control = false) {
+  if (monochrome_control && (_memicmp(color, "#0e416c", 7) == 0 || _memicmp(color, "#009ad9", 7) == 0)) {
+    return "#ffffff";
+  }
   if (std::memcmp(color, "#0e416c", 7) == 0) {
     return "#1b70a8";
   }
@@ -5740,7 +6781,7 @@ const char* svg_icon_theme_replacement(const unsigned char* color, bool replace_
   return nullptr;
 }
 
-size_t patch_icon_theme_svg_colors(unsigned char* svg_begin, size_t svg_size) {
+size_t patch_icon_theme_svg_colors(unsigned char* svg_begin, size_t svg_size, bool monochrome_control = false) {
   if (!svg_begin || svg_size < 7) {
     return 0;
   }
@@ -5761,7 +6802,7 @@ size_t patch_icon_theme_svg_colors(unsigned char* svg_begin, size_t svg_size) {
       color += 6;
       continue;
     }
-    const char* replacement = svg_icon_theme_replacement(color, replace_black);
+    const char* replacement = svg_icon_theme_replacement(color, replace_black, monochrome_control);
     if (!replacement || std::memcmp(color, replacement, 7) == 0) {
       continue;
     }
@@ -6027,14 +7068,81 @@ bool resolve_scene_search_icon_api(const QtLookup& lookup) {
   return api.icon_pixmap && api.pixmap_to_image && api.pixmap_from_image && api.pixmap_destructor;
 }
 
-bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* source, void* result, bool enabled) {
+struct ControlPixmapApi {
+  long long(__cdecl* key)(const void*) = nullptr;
+  int(__cdecl* width)(const void*) = nullptr;
+  int(__cdecl* height)(const void*) = nullptr;
+  double(__cdecl* ratio)(const void*) = nullptr;
+  void(__cdecl* copy)(void*, const void*) = nullptr;
+  void*(__cdecl* image_rect)(const void*, void*) = nullptr;
+};
+
+const ControlPixmapApi& control_pixmap_api() {
+  static const auto api = [] {
+    const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+    ControlPixmapApi result;
+    result.key = reinterpret_cast<decltype(result.key)>(GetProcAddress(gui, "?cacheKey@QPixmap@@QEBA_JXZ"));
+    result.width = reinterpret_cast<decltype(result.width)>(GetProcAddress(gui, "?width@QPixmap@@QEBAHXZ"));
+    result.height = reinterpret_cast<decltype(result.height)>(GetProcAddress(gui, "?height@QPixmap@@QEBAHXZ"));
+    result.ratio = reinterpret_cast<decltype(result.ratio)>(GetProcAddress(gui, "?devicePixelRatio@QPixmap@@QEBANXZ"));
+    result.copy = reinterpret_cast<decltype(result.copy)>(GetProcAddress(gui, "??0QPixmap@@QEAA@AEBV0@@Z"));
+    result.image_rect = reinterpret_cast<decltype(result.image_rect)>(GetProcAddress(gui, "?rect@QImage@@QEBA?AVQRect@@XZ"));
+    return result;
+  }();
+  return api;
+}
+
+struct ControlPixmapEntry {
+  std::array<std::uint64_t, 7> key = {};
+  std::uint64_t age = 0;
+  size_t bytes = 0;
+  alignas(16) unsigned char pixmap[256] = {};
+};
+std::vector<std::unique_ptr<ControlPixmapEntry>> g_control_pixmaps;
+size_t g_control_pixmap_bytes = 0;
+std::uint64_t g_control_pixmap_age = 0;
+constexpr size_t control_pixmap_budget = 8 * 1024 * 1024;
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_control_pixmap_builds = 0;
+#endif
+
+void clear_control_pixmaps() {
+  for (const auto& entry : g_control_pixmaps) {
+    reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(entry->pixmap);
+  }
+  g_control_pixmaps.clear();
+  g_control_pixmap_bytes = 0;
+}
+
+bool create_tinted_control_pixmap(const QtLookup& lookup, const void* source, void* result, bool enabled,
+                                  unsigned int foreground, int logical_width = 0, int logical_height = 0) {
   if (!source || !result || !resolve_toolbar_title_paint_api(lookup) || !resolve_scene_search_icon_api(lookup)) {
     return false;
   }
-  const auto image_rect = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
-    GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?rect@QImage@@QEBA?AVQRect@@XZ"));
-  if (!image_rect) {
+  const auto& cache_api = control_pixmap_api();
+  if (!cache_api.image_rect || !cache_api.copy) {
     return false;
+  }
+  std::array<std::uint64_t, 7> key = {};
+  size_t cost = 0;
+  if (cache_api.key && cache_api.width && cache_api.height && cache_api.ratio) {
+    const int width = cache_api.width(source);
+    const int height = cache_api.height(source);
+    const double ratio = cache_api.ratio(source);
+    if (width > 0 && height > 0 && width <= 2048 && height <= 2048 && ratio > 0 && ratio <= 8) {
+      key = {static_cast<std::uint64_t>(cache_api.key(source)), static_cast<std::uint64_t>(width),
+        static_cast<std::uint64_t>(height), enabled ? foreground : 0x707070u,
+        static_cast<std::uint64_t>(logical_width), static_cast<std::uint64_t>(logical_height), 0};
+      std::memcpy(&key[6], &ratio, sizeof(ratio));
+      cost = static_cast<size_t>(width) * height * 4;
+      for (auto& entry : g_control_pixmaps) {
+        if (entry->key == key) {
+          entry->age = ++g_control_pixmap_age;
+          cache_api.copy(result, entry->pixmap);
+          return true;
+        }
+      }
+    }
   }
   const auto& api = g_scene_search_icon_api;
   alignas(16) unsigned char image[256] = {};
@@ -6044,17 +7152,54 @@ bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* so
     alignas(16) unsigned char painter[256] = {};
     alignas(16) unsigned char color[16] = {};
     reinterpret_cast<QtColorRgbCtorFn>(lookup.qcolor_rgb_ctor_proc)(color,
-      enabled ? 216 : 112, enabled ? 219 : 112, enabled ? 226 : 112, 255);
+      enabled ? (foreground >> 16) & 255 : 112, enabled ? (foreground >> 8) & 255 : 112,
+      enabled ? foreground & 255 : 112, 255);
     int icon_rect[4] = {};
-    image_rect(image, icon_rect);
+    cache_api.image_rect(image, icon_rect);
+    if (logical_width > 0 && logical_height > 0) {
+      icon_rect[2] = logical_width - 1;
+      icon_rect[3] = logical_height - 1;
+    }
     reinterpret_cast<void(__cdecl*)(void*, void*)>(g_toolbar_title_api.painter_ctor)(painter, image);
     reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(painter, 5);
     reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(painter, icon_rect, color);
+    if (logical_width == 32 && logical_height == 32) {
+      reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(painter, 2);
+      const int caps[2][4] = {{0, 0, 1, 1}, {0, 30, 1, 31}};
+      for (const auto& cap : caps) {
+        reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(painter, cap, color);
+      }
+    }
     reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.painter_destructor)(painter);
     reinterpret_cast<void*(__cdecl*)(void*, const void*, unsigned int)>(api.pixmap_from_image)(result, image, 0);
+#if defined(DARKMODE_RUNTIME_TESTING)
+    ++g_test_control_pixmap_builds;
+#endif
+    if (key[0] && cost && cost <= control_pixmap_budget) {
+      while (!g_control_pixmaps.empty() &&
+          (g_control_pixmaps.size() >= 256 || g_control_pixmap_bytes + cost > control_pixmap_budget)) {
+        const auto oldest = std::min_element(g_control_pixmaps.begin(), g_control_pixmaps.end(),
+          [](const auto& first, const auto& second) { return first->age < second->age; });
+        g_control_pixmap_bytes -= (*oldest)->bytes;
+        reinterpret_cast<void(__cdecl*)(void*)>(api.pixmap_destructor)((*oldest)->pixmap);
+        g_control_pixmaps.erase(oldest);
+      }
+      auto entry = std::make_unique<ControlPixmapEntry>();
+      entry->key = key;
+      entry->age = ++g_control_pixmap_age;
+      entry->bytes = cost;
+      cache_api.copy(entry->pixmap, result);
+      g_control_pixmap_bytes += cost;
+      g_control_pixmaps.push_back(std::move(entry));
+    }
   }
   reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(image);
   return valid;
+}
+
+bool create_content_browser_search_pixmap(const QtLookup& lookup, const void* source, void* result, bool enabled,
+                                         unsigned int foreground = 0xd8dbe2) {
+  return create_tinted_control_pixmap(lookup, source, result, enabled, foreground);
 }
 
 bool refresh_panel_header_chevron(const QtLookup& lookup, void* header) {
@@ -6119,24 +7264,49 @@ const void* content_browser_search_vtable() {
   return vtable;
 }
 
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_content_device_classifications = 0;
+#endif
+
+unsigned int content_browser_device_offset(const void* const* table) {
+  static thread_local std::unordered_map<const void*, unsigned int> offsets;
+  const auto found = offsets.find(table);
+  if (found != offsets.end()) {
+    return found->second;
+  }
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_content_device_classifications;
+#endif
+  if (!table || !memory_readable(table - 1, sizeof(void*))) {
+    return 0;
+  }
+  const auto* locator = static_cast<const unsigned int*>(table[-1]);
+  const unsigned int offset = memory_readable(locator, 3 * sizeof(unsigned int)) && locator[0] == 1 &&
+    locator[1] > 0 && locator[1] <= 4096 && locator[2] == 0 ? locator[1] : 0;
+  MEMORY_BASIC_INFORMATION region = {};
+  if (offsets.size() < 128 && VirtualQuery(table - 1, &region, sizeof(region)) == sizeof(region) &&
+      region.Type == MEM_IMAGE && region.Protect == PAGE_READONLY &&
+      (region.AllocationBase == GetModuleHandleW(nullptr) || region.AllocationBase == GetModuleHandleW(L"Qt6Widgets.dll") ||
+       region.AllocationBase == GetModuleHandleW(L"Qt6Gui.dll"))) {
+    offsets.emplace(table, offset);
+  }
+  return offset;
+}
+
 const void* content_browser_search_device_owner(const void* device, const void* expected_vtable) {
   if (!expected_vtable || !memory_readable(device, sizeof(void*))) {
     return nullptr;
   }
   const auto* table = *static_cast<const void* const* const*>(device);
-  if (!table || !memory_readable(table - 1, sizeof(void*))) {
-    return nullptr;
-  }
-  const auto* locator = static_cast<const unsigned int*>(table[-1]);
-  if (!memory_readable(locator, 3 * sizeof(unsigned int)) || locator[0] != 1 ||
-      locator[1] == 0 || locator[1] > 4096 || locator[2] != 0) {
+  const unsigned int offset = content_browser_device_offset(table);
+  if (!offset) {
     return nullptr;
   }
   const auto address = reinterpret_cast<std::uintptr_t>(device);
-  if (address < 0x10000 + locator[1]) {
+  if (address < 0x10000 + offset) {
     return nullptr;
   }
-  const auto* owner = reinterpret_cast<const void*>(address - locator[1]);
+  const auto* owner = reinterpret_cast<const void*>(address - offset);
   return memory_readable(owner, sizeof(void*)) && *static_cast<const void* const*>(owner) == expected_vtable
     ? owner : nullptr;
 }
@@ -6180,6 +7350,7 @@ void __cdecl content_browser_search_draw_pixmap_hook(void* painter, const void* 
 bool set_content_browser_search_icon_hook(const QtLookup& lookup, bool dark) {
   g_content_browser_search_dark = false;
   if (!dark) {
+    clear_control_pixmaps();
     for (auto hook = g_content_browser_search_pixmap_hooks.begin(); hook != g_content_browser_search_pixmap_hooks.end();) {
       if (*hook->slot == reinterpret_cast<void*>(&content_browser_search_draw_pixmap_hook)) {
         DWORD protection = 0;
@@ -6247,33 +7418,18 @@ void* __cdecl scene_search_pixmap_hook(const void* icon, void* result, const voi
       !(ratio > 0 && ratio <= 8)) {
     return result;
   }
-  alignas(16) unsigned char image[256] = {};
-  reinterpret_cast<void*(__cdecl*)(const void*, void*)>(api.pixmap_to_image)(result, image);
-  if (!reinterpret_cast<bool(__cdecl*)(const void*)>(g_toolbar_title_api.image_is_null)(image)) {
-    alignas(16) unsigned char mask_painter[256] = {};
-    alignas(16) unsigned char color[16] = {};
-    reinterpret_cast<QtColorRgbCtorFn>(resolve_qt_lookup().qcolor_rgb_ctor_proc)(color,
-      context->enabled ? 216 : 112, context->enabled ? 219 : 112, context->enabled ? 226 : 112, 255);
-    const int icon_rect[4] = {0, 0, dimensions[0] - 1, dimensions[1] - 1};
-    reinterpret_cast<void(__cdecl*)(void*, void*)>(g_toolbar_title_api.painter_ctor)(mask_painter, image);
-    reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(mask_painter, 5);
-    reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(mask_painter, icon_rect, color);
-    if (dimensions[0] == 32 && dimensions[1] == 32) {
-      reinterpret_cast<void(__cdecl*)(void*, int)>(g_toolbar_title_api.painter_composition)(mask_painter, 2);
-      const int caps[2][4] = {{0, 0, 1, 1}, {0, 30, 1, 31}};
-      for (const auto& cap : caps) {
-        reinterpret_cast<void(__cdecl*)(void*, const void*, const void*)>(g_toolbar_title_api.fill_rect)(mask_painter, cap, color);
-      }
-    }
-    reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.painter_destructor)(mask_painter);
+  alignas(16) unsigned char tinted[256] = {};
+  if (create_tinted_control_pixmap(resolve_qt_lookup(), result, tinted, context->enabled, 0xd8dbe2,
+      dimensions[0], dimensions[1])) {
     reinterpret_cast<void(__cdecl*)(void*)>(api.pixmap_destructor)(result);
-    reinterpret_cast<void*(__cdecl*)(void*, const void*, unsigned int)>(api.pixmap_from_image)(result, image, 0);
+    control_pixmap_api().copy(result, tinted);
+    reinterpret_cast<void(__cdecl*)(void*)>(api.pixmap_destructor)(tinted);
   }
-  reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(image);
   return result;
 }
 
 void remove_scene_search_pixmap_hooks() {
+  clear_control_pixmaps();
   for (auto hook = g_scene_search_pixmap_hooks.begin(); hook != g_scene_search_pixmap_hooks.end();) {
     if (*hook->slot == reinterpret_cast<void*>(&scene_search_pixmap_hook)) {
       DWORD protection = 0;
@@ -6433,6 +7589,10 @@ void __cdecl scene_search_label_hook(const void* style, int control, const void*
     return;
   }
   const auto original_proc = reinterpret_cast<ToolbarTitleDrawFn>(hook->original_proc);
+  if (g_modern_workspace_dark && draw_modern_workspace_control(resolve_qt_lookup(), style, control,
+      option, painter, widget, original_proc)) {
+    return;
+  }
   if (g_toolbar_title_dark && control == 30 && widget) {
     const QtLookup& lookup = resolve_qt_lookup();
     if (is_sketchup_toolbar(lookup, widget) && !qt_object_inherits(lookup, widget, "NonCustomizableToolbar") &&
@@ -6464,7 +7624,10 @@ bool install_style_control_hook(const QtLookup& lookup, const void* widget) {
   if (!pointer_looks_like_cpp_object(style) || !memory_readable(*static_cast<void***>(style), 23 * sizeof(void*))) {
     return false;
   }
-  void** slot = *static_cast<void***>(style) + 22;
+  return install_style_control_slot(*static_cast<void***>(style) + 22);
+}
+
+bool install_style_control_slot(void** slot) {
   for (const VcbStatusPaintHook& hook : g_scene_search_hooks) {
     if (hook.slot == slot) {
       return *slot == reinterpret_cast<void*>(&scene_search_label_hook);
@@ -6496,7 +7659,7 @@ bool install_scene_search_label_hook(const QtLookup& lookup, const void* widget)
 }
 
 void remove_unused_style_control_hooks() {
-  if (g_scene_search_dark || g_toolbar_title_dark) {
+  if (g_scene_search_dark || g_toolbar_title_dark || g_modern_workspace_dark) {
     return;
   }
   for (auto hook = g_scene_search_hooks.begin(); hook != g_scene_search_hooks.end();) {
@@ -6635,11 +7798,11 @@ bool refresh_page_tabs_search_icon(const QtLookup& lookup, void* shown_widget) {
 }
 
 void write_page_tabs_pushbutton_inventory(const QtLookup& lookup) {
-  if (g_icon_theme_status_path.empty() || !lookup.app_all_widgets_proc || !lookup.widget_parent_widget_proc) {
+  if (g_icon_theme_inventory_directory.empty() || !lookup.app_all_widgets_proc || !lookup.widget_parent_widget_proc) {
     return;
   }
 
-  const std::filesystem::path inventory_path = g_icon_theme_status_path.parent_path() / L"page-tabs-pushbutton-inventory.txt";
+  const std::filesystem::path inventory_path = g_icon_theme_inventory_directory / L"page-tabs-pushbutton-inventory.txt";
   std::ofstream output(inventory_path, std::ios::trunc);
   if (!output) {
     return;
@@ -6757,11 +7920,11 @@ bool qt_object_has_ancestor_vtable(const QtLookup& lookup, const void* object, c
 }
 
 void write_scene_search_widget_inventory(const QtLookup& lookup) {
-  if (g_icon_theme_status_path.empty() || !lookup.app_all_widgets_proc || !lookup.object_parent_proc) {
+  if (g_icon_theme_inventory_directory.empty() || !lookup.app_all_widgets_proc || !lookup.object_parent_proc) {
     return;
   }
 
-  const std::filesystem::path inventory_path = g_icon_theme_status_path.parent_path() / L"scene-search-widget-inventory.txt";
+  const std::filesystem::path inventory_path = g_icon_theme_inventory_directory / L"scene-search-widget-inventory.txt";
   std::ofstream output(inventory_path, std::ios::trunc);
   if (!output) {
     return;
@@ -6785,7 +7948,64 @@ void write_scene_search_widget_inventory(const QtLookup& lookup) {
   output << "matching-widgets=" << matching_count << '\n';
 }
 
-size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias) {
+size_t patch_compressed_control_svg(const QtLookup& lookup, unsigned char* data, size_t size) {
+  if (!data || size < 4 || size > 1024 * 1024 || !memory_readable(data, size) ||
+      !lookup.qbytearray_size_proc || !lookup.qbytearray_const_data_proc || !lookup.qbytearray_destructor_proc) {
+    return 0;
+  }
+  const size_t expected_size = (static_cast<std::uint32_t>(data[0]) << 24) |
+    (static_cast<std::uint32_t>(data[1]) << 16) | (static_cast<std::uint32_t>(data[2]) << 8) | data[3];
+  if (expected_size == 0 || expected_size > 1024 * 1024) {
+    return 0;
+  }
+  std::string module;
+  std::string symbol;
+  const auto uncompress = reinterpret_cast<void*(__cdecl*)(void*, const unsigned char*, long long)>(
+    find_export(lookup.core_modules, {"?qUncompress@@YA?AVQByteArray@@PEBE_J@Z"}, module, symbol));
+  const auto compress = reinterpret_cast<void*(__cdecl*)(void*, const unsigned char*, long long, int)>(
+    find_export(lookup.core_modules, {"?qCompress@@YA?AVQByteArray@@PEBE_JH@Z"}, module, symbol));
+  if (!uncompress || !compress) {
+    return 0;
+  }
+  const auto array_size = reinterpret_cast<long long(__cdecl*)(const void*)>(lookup.qbytearray_size_proc);
+  const auto array_data = reinterpret_cast<const unsigned char*(__cdecl*)(const void*)>(lookup.qbytearray_const_data_proc);
+  const auto destroy = reinterpret_cast<void(__cdecl*)(void*)>(lookup.qbytearray_destructor_proc);
+  alignas(16) unsigned char decoded[64] = {};
+  uncompress(decoded, data, static_cast<long long>(size));
+  std::vector<unsigned char> svg;
+  if (array_size(decoded) == static_cast<long long>(expected_size) && memory_readable(array_data(decoded), expected_size)) {
+    svg.assign(array_data(decoded), array_data(decoded) + expected_size);
+  }
+  destroy(decoded);
+  constexpr char svg_open[] = "<svg";
+  constexpr char svg_close[] = "</svg>";
+  if (svg.empty() || std::search(svg.begin(), svg.end(), svg_open, svg_open + sizeof(svg_open) - 1) == svg.end() ||
+      std::search(svg.begin(), svg.end(), svg_close, svg_close + sizeof(svg_close) - 1) == svg.end()) {
+    return 0;
+  }
+  const size_t changed = patch_icon_theme_svg_colors(svg.data(), svg.size(), true);
+  if (changed == 0) {
+    return 0;
+  }
+  alignas(16) unsigned char encoded[64] = {};
+  compress(encoded, svg.data(), static_cast<long long>(svg.size()), 9);
+  const long long encoded_size = array_size(encoded);
+  size_t patched = 0;
+  DWORD protection = 0;
+  if (encoded_size > 0 && static_cast<size_t>(encoded_size) <= size &&
+      memory_readable(array_data(encoded), static_cast<size_t>(encoded_size)) &&
+      VirtualProtect(data, size, PAGE_READWRITE, &protection)) {
+    std::memcpy(data, array_data(encoded), static_cast<size_t>(encoded_size));
+    std::memset(data + encoded_size, 0, size - static_cast<size_t>(encoded_size));
+    DWORD unused = 0;
+    VirtualProtect(data, size, protection, &unused);
+    patched = changed;
+  }
+  destroy(encoded);
+  return patched;
+}
+
+size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias, bool monochrome_control = false) {
   if (!alias || !lookup.from_utf8_proc || !lookup.qstring_destructor_proc) {
     return 0;
   }
@@ -6793,19 +8013,22 @@ size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias)
   std::string resource_module;
   std::string resource_symbol;
   const FARPROC resource_constructor_proc = find_export(lookup.core_modules, {
-    "??0QResource@@QEAA@XZ"
+    "??0QResource@@QEAA@AEBVQString@@AEBVQLocale@@@Z"
   }, resource_module, resource_symbol);
   const FARPROC resource_destructor_proc = find_export(lookup.core_modules, {
     "??1QResource@@QEAA@XZ"
   }, resource_module, resource_symbol);
-  const FARPROC resource_set_file_name_proc = find_export(lookup.core_modules, {
-    "?setFileName@QResource@@QEAAXAEBVQString@@@Z"
+  const FARPROC locale_constructor_proc = find_export(lookup.core_modules, {
+    "??0QLocale@@QEAA@XZ"
+  }, resource_module, resource_symbol);
+  const FARPROC locale_destructor_proc = find_export(lookup.core_modules, {
+    "??1QLocale@@QEAA@XZ"
   }, resource_module, resource_symbol);
   const FARPROC resource_is_valid_proc = find_export(lookup.core_modules, {
     "?isValid@QResource@@QEBA_NXZ"
   }, resource_module, resource_symbol);
-  const FARPROC resource_is_compressed_proc = find_export(lookup.core_modules, {
-    "?isCompressed@QResource@@QEBA_NXZ"
+  const FARPROC resource_compression_proc = find_export(lookup.core_modules, {
+    "?compressionAlgorithm@QResource@@QEBA?AW4Compression@1@XZ"
   }, resource_module, resource_symbol);
   const FARPROC resource_data_proc = find_export(lookup.core_modules, {
     "?data@QResource@@QEBAPEBEXZ"
@@ -6813,8 +8036,8 @@ size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias)
   const FARPROC resource_size_proc = find_export(lookup.core_modules, {
     "?size@QResource@@QEBA_JXZ"
   }, resource_module, resource_symbol);
-  if (!resource_constructor_proc || !resource_destructor_proc || !resource_set_file_name_proc ||
-      !resource_is_valid_proc || !resource_is_compressed_proc || !resource_data_proc || !resource_size_proc) {
+  if (!resource_constructor_proc || !resource_destructor_proc || !locale_constructor_proc || !locale_destructor_proc ||
+      !resource_is_valid_proc || !resource_compression_proc || !resource_data_proc || !resource_size_proc) {
     return 0;
   }
 
@@ -6822,12 +8045,13 @@ size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias)
   using QtFromUtf8LongLongFn = void(__cdecl*)(void*, const char*, long long);
   using QtNoArgCtorFn = void(__cdecl*)(void*);
   using QtDestructorFn = void(__cdecl*)(void*);
-  using QtResourceSetFileNameFn = void(__cdecl*)(void*, const void*);
+  using QtResourceCtorFn = void(__cdecl*)(void*, const void*, const void*);
   using QtResourceBoolFn = bool(__cdecl*)(const void*);
   using QtResourceDataFn = const unsigned char*(__cdecl*)(const void*);
   using QtResourceSizeFn = long long(__cdecl*)(const void*);
 
   alignas(16) unsigned char qstring_storage[64] = {};
+  alignas(16) unsigned char locale_storage[64] = {};
   alignas(16) unsigned char resource_storage[256] = {};
   const size_t alias_length = std::strlen(alias);
   if (lookup.from_utf8_symbol.find("_J") != std::string::npos) {
@@ -6836,19 +8060,21 @@ size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias)
     reinterpret_cast<QtFromUtf8IntFn>(lookup.from_utf8_proc)(qstring_storage, alias, static_cast<int>(alias_length));
   }
 
-  reinterpret_cast<QtNoArgCtorFn>(resource_constructor_proc)(resource_storage);
-  reinterpret_cast<QtResourceSetFileNameFn>(resource_set_file_name_proc)(resource_storage, qstring_storage);
+  reinterpret_cast<QtNoArgCtorFn>(locale_constructor_proc)(locale_storage);
+  reinterpret_cast<QtResourceCtorFn>(resource_constructor_proc)(resource_storage, qstring_storage, locale_storage);
 
   size_t patched_count = 0;
   const bool valid = reinterpret_cast<QtResourceBoolFn>(resource_is_valid_proc)(resource_storage);
-  const bool compressed = valid && reinterpret_cast<QtResourceBoolFn>(resource_is_compressed_proc)(resource_storage);
-  const long long resource_size = valid && !compressed
+  const int compression = valid ? reinterpret_cast<int(__cdecl*)(const void*)>(resource_compression_proc)(resource_storage) : -1;
+  const long long resource_size = valid && (compression == 0 || (compression == 1 && monochrome_control))
     ? reinterpret_cast<QtResourceSizeFn>(resource_size_proc)(resource_storage)
     : 0;
   const auto* data = resource_size > 0
     ? reinterpret_cast<QtResourceDataFn>(resource_data_proc)(resource_storage)
     : nullptr;
-  if (data && resource_size > 0 && resource_size <= 1024 * 1024 &&
+  if (data && compression == 1) {
+    patched_count = patch_compressed_control_svg(lookup, const_cast<unsigned char*>(data), static_cast<size_t>(resource_size));
+  } else if (data && resource_size > 0 && resource_size <= 1024 * 1024 &&
       memory_readable(data, static_cast<size_t>(resource_size))) {
     constexpr char svg_open[] = "<svg";
     constexpr char svg_close[] = "</svg>";
@@ -6859,14 +8085,232 @@ size_t patch_icon_theme_qresource_svg(const QtLookup& lookup, const char* alias)
       if (svg_close_begin != resource_end) {
         const auto* svg_end = svg_close_begin + std::size(svg_close) - 1;
         patched_count = patch_icon_theme_svg_colors(
-          const_cast<unsigned char*>(svg_begin), static_cast<size_t>(svg_end - svg_begin));
+          const_cast<unsigned char*>(svg_begin), static_cast<size_t>(svg_end - svg_begin), monochrome_control);
       }
     }
   }
 
   reinterpret_cast<QtDestructorFn>(resource_destructor_proc)(resource_storage);
+  reinterpret_cast<QtDestructorFn>(locale_destructor_proc)(locale_storage);
   reinterpret_cast<QtDestructorFn>(lookup.qstring_destructor_proc)(qstring_storage);
   return patched_count;
+}
+
+bool refresh_modern_tray_hide_icon(const QtLookup& lookup, void* widget) {
+  if (!qt_object_inherits(lookup, widget, "QToolButton") ||
+      !qt_object_inherits(lookup, qwidget_parent_widget(lookup, widget), "CPanelHeader") ||
+      !lookup.object_object_name_proc || !lookup.qstring_destructor_proc || !resolve_scene_search_icon_api(lookup)) {
+    return false;
+  }
+  alignas(16) unsigned char name[64] = {};
+  reinterpret_cast<void*(__cdecl*)(const void*, void*)>(lookup.object_object_name_proc)(widget, name);
+  const bool close_button = qstring_to_utf8(lookup, name) == "hide_button_";
+  reinterpret_cast<void(__cdecl*)(void*)>(lookup.qstring_destructor_proc)(name);
+  if (!close_button) {
+    return false;
+  }
+  HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  HMODULE widgets = GetModuleHandleW(L"Qt6Widgets.dll");
+  const auto icon_get = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(widgets, "?icon@QAbstractButton@@QEBA?AVQIcon@@XZ"));
+  const auto icon_set = reinterpret_cast<void(__cdecl*)(void*, const void*)>(
+    GetProcAddress(widgets, "?setIcon@QAbstractButton@@QEAAXAEBVQIcon@@@Z"));
+  const auto icon_size = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(widgets, "?iconSize@QAbstractButton@@QEBA?AVQSize@@XZ"));
+  const auto ratio = reinterpret_cast<double(__cdecl*)(const void*)>(
+    GetProcAddress(gui, "?devicePixelRatioF@QPaintDevice@@QEBANXZ"));
+  const auto icon_ctor = reinterpret_cast<void(__cdecl*)(void*)>(GetProcAddress(gui, "??0QIcon@@QEAA@XZ"));
+  const auto icon_destroy = reinterpret_cast<void(__cdecl*)(void*)>(GetProcAddress(gui, "??1QIcon@@QEAA@XZ"));
+  const auto add_pixmap = reinterpret_cast<void(__cdecl*)(void*, const void*, int, int)>(
+    GetProcAddress(gui, "?addPixmap@QIcon@@QEAAXAEBVQPixmap@@W4Mode@1@W4State@1@@Z"));
+  if (!icon_get || !icon_set || !icon_size || !ratio || !icon_ctor || !icon_destroy || !add_pixmap) {
+    return false;
+  }
+  int size[2] = {};
+  icon_size(widget, size);
+  const double scale = ratio(static_cast<const unsigned char*>(widget) + 16);
+  if (size[0] < 1 || size[1] < 1 || size[0] > 256 || size[1] > 256 || scale <= 0 || scale > 8) {
+    return false;
+  }
+  alignas(16) unsigned char original[64] = {};
+  alignas(16) unsigned char replacement[64] = {};
+  icon_get(widget, original);
+  icon_ctor(replacement);
+  bool complete = true;
+  for (int mode : {0, 1, 2, 3}) {
+    for (int state : {0, 1}) {
+      alignas(16) unsigned char source[256] = {};
+      alignas(16) unsigned char tinted[256] = {};
+      reinterpret_cast<void*(__cdecl*)(const void*, void*, const void*, double, int, int)>(
+        g_scene_search_icon_api.icon_pixmap)(original, source, size, scale, mode, state);
+      if (create_content_browser_search_pixmap(lookup, source, tinted, mode != 1, 0xffffff)) {
+        add_pixmap(replacement, tinted, mode, state);
+        reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(tinted);
+      } else {
+        complete = false;
+      }
+      reinterpret_cast<void(__cdecl*)(void*)>(g_scene_search_icon_api.pixmap_destructor)(source);
+    }
+  }
+  if (complete) {
+    icon_set(widget, replacement);
+  }
+  icon_destroy(replacement);
+  icon_destroy(original);
+  return complete;
+}
+
+std::vector<void*> collect_modern_control_icon_objects(const QtLookup& lookup) {
+  std::vector<void*> objects;
+  std::vector<void*> owners;
+  static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, objects, static_cast<size_t>(-1)));
+  std::unordered_set<void*> visited;
+  for (size_t index = 0; index < objects.size() && visited.size() < 65536; ++index) {
+    void* object = objects[index];
+    if (!visited.insert(object).second || !pointer_looks_like_cpp_object(object)) {
+      continue;
+    }
+    if (qt_object_inherits(lookup, object, "QAbstractButton") || qt_object_inherits(lookup, object, "QAction")) {
+      owners.push_back(object);
+    }
+    const void* list = nullptr;
+    if (try_qobject_children_list(lookup.object_children_proc, object, &list)) {
+      const auto children = decode_qt_pointer_list(list);
+      if (children.items && children.size > 0 && children.size <= 65536 &&
+          memory_readable(children.items, static_cast<size_t>(children.size) * sizeof(void*))) {
+        objects.insert(objects.end(), children.items, children.items + children.size);
+      }
+    }
+  }
+  return owners;
+}
+
+size_t patch_modern_workspace_control_resource(const QtLookup& lookup, const char* alias,
+                                               const std::vector<void*>* inventory = nullptr) {
+  const bool refresh_cached_icon = std::strcmp(alias, ":/tb_copy") == 0 ||
+    std::strcmp(alias, ":/dlg_tray_dialog_hide") == 0 || std::strcmp(alias, ":/dlg_in_model") == 0 ||
+    std::strcmp(alias, ":/dlg_update") == 0 || std::strcmp(alias, ":/dlg_move_item_up") == 0 ||
+    std::strcmp(alias, ":/dlg_move_item_down") == 0;
+  if (!refresh_cached_icon || !lookup.app_all_widgets_proc ||
+      !lookup.from_utf8_proc || !lookup.qstring_destructor_proc) {
+    return patch_icon_theme_qresource_svg(lookup, alias, true);
+  }
+  HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  HMODULE widgets = GetModuleHandleW(L"Qt6Widgets.dll");
+  const auto icon_ctor = reinterpret_cast<void(__cdecl*)(void*, const void*)>(
+    GetProcAddress(gui, "??0QIcon@@QEAA@AEBVQString@@@Z"));
+  const auto icon_destroy = reinterpret_cast<void(__cdecl*)(void*)>(GetProcAddress(gui, "??1QIcon@@QEAA@XZ"));
+  const auto pixmap = reinterpret_cast<void*(__cdecl*)(const void*, void*, int, int, int, int)>(
+    GetProcAddress(gui, "?pixmap@QIcon@@QEBA?AVQPixmap@@HHW4Mode@1@W4State@1@@Z"));
+  const auto to_image = reinterpret_cast<void*(__cdecl*)(const void*, void*)>(
+    GetProcAddress(gui, "?toImage@QPixmap@@QEBA?AVQImage@@XZ"));
+  const auto pixmap_destroy = reinterpret_cast<void(__cdecl*)(void*)>(GetProcAddress(gui, "??1QPixmap@@UEAA@XZ"));
+  const auto image_destroy = reinterpret_cast<void(__cdecl*)(void*)>(GetProcAddress(gui, "??1QImage@@UEAA@XZ"));
+  const auto image_equal = reinterpret_cast<bool(__cdecl*)(const void*, const void*)>(
+    GetProcAddress(gui, "??8QImage@@QEBA_NAEBV0@@Z"));
+  const auto image_null = reinterpret_cast<bool(__cdecl*)(const void*)>(GetProcAddress(gui, "?isNull@QImage@@QEBA_NXZ"));
+  const auto clear_cache = reinterpret_cast<void(__cdecl*)()>(GetProcAddress(gui, "?clear@QPixmapCache@@SAXXZ"));
+  const FARPROC button_get = GetProcAddress(widgets, "?icon@QAbstractButton@@QEBA?AVQIcon@@XZ");
+  const FARPROC button_set = GetProcAddress(widgets, "?setIcon@QAbstractButton@@QEAAXAEBVQIcon@@@Z");
+  const FARPROC action_get = GetProcAddress(gui, "?icon@QAction@@QEBA?AVQIcon@@XZ");
+  const FARPROC action_set = GetProcAddress(gui, "?setIcon@QAction@@QEAAXAEBVQIcon@@@Z");
+  if (!icon_ctor || !icon_destroy || !pixmap || !to_image || !pixmap_destroy || !image_destroy ||
+      !image_equal || !image_null || !clear_cache || !button_get || !button_set || !action_get || !action_set) {
+    return patch_icon_theme_qresource_svg(lookup, alias, true);
+  }
+  alignas(16) unsigned char filename[64] = {};
+  alignas(16) unsigned char original_icon[64] = {};
+  reinterpret_cast<void(__cdecl*)(void*, const char*, long long)>(lookup.from_utf8_proc)(
+    filename, alias, static_cast<long long>(std::strlen(alias)));
+  icon_ctor(original_icon, filename);
+  alignas(16) unsigned char reference_images[8][256] = {};
+  size_t reference_index = 0;
+  for (int extent : {16, 32}) {
+    for (int mode : {0, 1}) {
+      for (int state : {0, 1}) {
+        alignas(16) unsigned char reference_pixmap[256] = {};
+        pixmap(original_icon, reference_pixmap, extent, extent, mode, state);
+        to_image(reference_pixmap, reference_images[reference_index++]);
+        pixmap_destroy(reference_pixmap);
+      }
+    }
+  }
+  const auto matches_original = [&](const void* candidate) {
+    size_t image_index = 0;
+    for (int extent : {16, 32}) {
+      for (int mode : {0, 1}) {
+        for (int state : {0, 1}) {
+          alignas(16) unsigned char candidate_pixmap[256] = {};
+          alignas(16) unsigned char candidate_image[256] = {};
+          pixmap(candidate, candidate_pixmap, extent, extent, mode, state);
+          to_image(candidate_pixmap, candidate_image);
+          const void* reference_image = reference_images[image_index++];
+          const bool matches = !image_null(reference_image) && image_equal(reference_image, candidate_image);
+          image_destroy(candidate_image);
+          pixmap_destroy(candidate_pixmap);
+          if (!matches) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  };
+  struct IconOwner { void* object; FARPROC setter; };
+  std::vector<IconOwner> owners;
+  size_t raster_closes = 0;
+  const auto local_inventory = inventory ? std::vector<void*>{} : collect_modern_control_icon_objects(lookup);
+  for (void* object : inventory ? *inventory : local_inventory) {
+    if (!pointer_looks_like_cpp_object(object)) {
+      continue;
+    }
+    const bool button = qt_object_inherits(lookup, object, "QAbstractButton");
+    if (button && std::strcmp(alias, ":/dlg_tray_dialog_hide") == 0 && refresh_modern_tray_hide_icon(lookup, object)) {
+      ++raster_closes;
+    } else if (button || qt_object_inherits(lookup, object, "QAction")) {
+      alignas(16) unsigned char candidate[64] = {};
+      reinterpret_cast<void*(__cdecl*)(const void*, void*)>(button ? button_get : action_get)(object, candidate);
+      if (matches_original(candidate)) {
+        owners.push_back({object, button ? button_set : action_set});
+      }
+      icon_destroy(candidate);
+    }
+  }
+  const size_t patched = patch_icon_theme_qresource_svg(lookup, alias, true);
+  if (patched && !owners.empty()) {
+    clear_cache();
+    alignas(16) unsigned char replacement[64] = {};
+    icon_ctor(replacement, filename);
+    for (const IconOwner& owner : owners) {
+      if (pointer_looks_like_cpp_object(owner.object)) {
+        reinterpret_cast<void(__cdecl*)(void*, const void*)>(owner.setter)(owner.object, replacement);
+      }
+    }
+    icon_destroy(replacement);
+  }
+  for (auto& image : reference_images) {
+    image_destroy(image);
+  }
+  icon_destroy(original_icon);
+  reinterpret_cast<void(__cdecl*)(void*)>(lookup.qstring_destructor_proc)(filename);
+  return patched + raster_closes;
+}
+
+size_t patch_modern_workspace_control_resources(const QtLookup& lookup) {
+  if (modern_workspace_types().empty()) {
+    return 0;
+  }
+  const auto inventory = collect_modern_control_icon_objects(lookup);
+  size_t patched = 0;
+  for (const char* alias : {":/scene_search.svg", ":/u_visible", ":/u_notvisible", ":/u_lock", ":/u_unlock",
+       ":/dlg_info", ":/dlg_entity_panel_controls_tab.svg", ":/dlg_entity_panel_tags_tab.svg",
+       ":/dlg_classification_mode", ":/dlg_classification_tags_mode", ":/dlg_classification_add_simple",
+       ":/dlg_classification_tag_remove.svg", ":/dlg_agent_aimm_blue", ":/tb_copy", ":/options",
+      ":/list_view.svg", ":/plus_circled", ":/dlg_tray_dialog_hide", ":/dlg_in_model",
+      ":/dlg_update", ":/dlg_move_item_up", ":/dlg_move_item_down"}) {
+    patched += patch_modern_workspace_control_resource(lookup, alias, &inventory);
+  }
+  return patched;
 }
 
 size_t patch_icon_theme_chevron_resources(const QtLookup& lookup) {
@@ -6958,6 +8402,11 @@ size_t rebuild_tray_hide_icons(const QtLookup& lookup) {
   const size_t patched_count = patch_icon_theme_qresource_svg(lookup, k_tray_hide_icon_resource_alias);
   if (patched_count > 0) {
     InterlockedExchange(&g_icon_theme_tray_hide_native_patch_count, static_cast<LONG>(patched_count));
+  }
+
+  if (!modern_workspace_types().empty()) {
+    InterlockedExchange(&g_icon_theme_tray_hide_native_rebuild_count, 0);
+    return 0;
   }
 
   std::string icon_constructor_module;
@@ -7062,12 +8511,13 @@ size_t patch_all_icon_theme_svg_colors() {
 
 size_t apply_icon_theme_resource_patches(const QtLookup& lookup) {
   constexpr bool direct_chevron_resource_patch_enabled = false;
+  const size_t workspace_control_patch_count = patch_modern_workspace_control_resources(lookup);
   const size_t compiled_patch_count = patch_all_icon_theme_svg_colors();
   const size_t chevron_patch_count = direct_chevron_resource_patch_enabled
     ? patch_icon_theme_chevron_resources(lookup)
     : 0;
   const size_t default_env_patch_count = patch_default_environment_svg();
-  const size_t patched_count = compiled_patch_count + chevron_patch_count + default_env_patch_count;
+  const size_t patched_count = workspace_control_patch_count + compiled_patch_count + chevron_patch_count + default_env_patch_count;
   InterlockedExchange(&g_icon_theme_resource_color_count, static_cast<LONG>(patched_count));
   InterlockedExchange(&g_icon_theme_chevron_resource_color_count, static_cast<LONG>(chevron_patch_count));
   InterlockedExchange(&g_icon_theme_default_env_color_count, static_cast<LONG>(default_env_patch_count));
@@ -7106,7 +8556,6 @@ bool configure_icon_theme(bool enabled) {
   std::lock_guard<std::mutex> lock(g_icon_theme_mutex);
   if (!enabled) {
     InterlockedExchange(&g_icon_theme_enabled, 0);
-    write_icon_theme_status("disabled");
     return true;
   }
 
@@ -7125,7 +8574,7 @@ bool configure_icon_theme(bool enabled) {
     set_theme_info("Dark Mode SKP icon patch: extension module path lookup failed.");
     return false;
   }
-  g_icon_theme_status_path = std::filesystem::path(module_path).parent_path() / L"icon-theme-status.txt";
+  g_icon_theme_inventory_directory = std::filesystem::path(module_path).parent_path();
   InterlockedExchange(&g_icon_theme_resource_color_count, 0);
   InterlockedExchange(&g_icon_theme_chevron_resource_color_count, 0);
   InterlockedExchange(&g_icon_theme_default_env_color_count, 0);
@@ -7136,19 +8585,16 @@ bool configure_icon_theme(bool enabled) {
   InterlockedExchange(&g_icon_theme_tray_hide_native_rebuild_count, 0);
   InterlockedExchange(&g_icon_theme_component_navigator_search_icon_count, 0);
   InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, 0);
-  write_icon_theme_status("initializing");
 
   const QtLookup& lookup = resolve_qt_lookup();
   const size_t resource_patch_count = apply_icon_theme_resource_patches(lookup);
   if (resource_patch_count == 0) {
     set_theme_info("Dark Mode SKP icon patch: stock SVG resources were unavailable.");
-    write_icon_theme_status("resource-patch-unavailable");
     return false;
   }
 
   InterlockedExchange(&g_icon_theme_enabled, 1);
   set_theme_info("Dark Mode SKP icon patch: enabled colors=" + std::to_string(resource_patch_count));
-  write_icon_theme_status("enabled");
   return true;
 }
 
@@ -7344,10 +8790,20 @@ bool apply_tag_dialog_header_colors_to_header(const QtLookup& lookup, void* head
   }
 
   bool changed = true;
+  static const auto rgba = reinterpret_cast<unsigned int(__cdecl*)(const void*)>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?rgba@QColor@@QEBAIXZ"));
   for (size_t index = 0; index < std::size(kTagHeaderColorOffsets); ++index) {
     auto* color = reinterpret_cast<unsigned char*>(object) + kTagHeaderColorOffsets[index];
-    if (!memory_readable(color, sizeof(active_backup->color_storage[index])) ||
-        !set_qcolor_rgba(lookup, color,
+    if (!memory_readable(color, sizeof(active_backup->color_storage[index]))) {
+      changed = false;
+      break;
+    }
+    const unsigned int expected = (static_cast<unsigned int>(kTagHeaderDarkColors[index][3]) << 24) |
+      (kTagHeaderDarkColors[index][0] << 16) | (kTagHeaderDarkColors[index][1] << 8) | kTagHeaderDarkColors[index][2];
+    if (rgba && rgba(color) == expected) {
+      continue;
+    }
+    if (!set_qcolor_rgba(lookup, color,
           kTagHeaderDarkColors[index][0], kTagHeaderDarkColors[index][1], kTagHeaderDarkColors[index][2], kTagHeaderDarkColors[index][3])) {
       changed = false;
       break;
@@ -7381,6 +8837,7 @@ size_t apply_tag_dialog_header_colors(const QtLookup& lookup, bool dark, int sta
 
   size_t applied = 0;
   if (!dark) {
+    clear_control_pixmaps();
     for (const std::unique_ptr<TagHeaderColorBackup>& backup_holder : g_tag_header_color_backups) {
       TagHeaderColorBackup& backup = *backup_holder;
       void* current_object = nullptr;
@@ -7799,6 +9256,109 @@ NativeFunctionCalls decode_native_function_calls(const NativeImageView& image, c
     reinterpret_cast<uint64_t>(function) + length;
   cs_free(instructions, count);
   return result;
+}
+
+struct ModernWorkspaceFrameCalls {
+  void** slot = nullptr;
+  std::vector<std::uintptr_t> returns;
+};
+
+ModernWorkspaceFrameCalls discover_modern_workspace_frame_calls(HMODULE module) {
+  const NativeImageView image(module);
+  void** slot = image.import_slot("??0QPen@@QEAA@AEBVQColor@@@Z");
+  if (!slot) {
+    return {};
+  }
+  csh decoder = 0;
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &decoder) != CS_ERR_OK) {
+    return {};
+  }
+  cs_option(decoder, CS_OPT_DETAIL, CS_OPT_ON);
+  ModernWorkspaceFrameCalls result{slot, {}};
+  for (const char* name : {".?AVGroup@QtWidgets@KDDockWidgets@@", ".?AVFloatingWindow@QtWidgets@KDDockWidgets@@"}) {
+    const auto* table = static_cast<const void* const*>(primary_rtti_vtable(find_vtables_for_type(name, module)));
+    if (!memory_readable(table, 28 * sizeof(void*))) {
+      result = {};
+      break;
+    }
+    const auto calls = decode_native_function_calls(image, table[27], decoder);
+    if (!calls.complete || std::count(calls.imports.begin(), calls.imports.end(), slot) != 1) {
+      result = {};
+      break;
+    }
+    const auto index = std::find(calls.imports.begin(), calls.imports.end(), slot) - calls.imports.begin();
+    result.returns.push_back(reinterpret_cast<std::uintptr_t>(image.base) + calls.import_returns[index]);
+  }
+  cs_close(&decoder);
+  return result;
+}
+
+VcbStatusPaintHook g_modern_workspace_frame_hook;
+std::vector<std::uintptr_t> g_modern_workspace_frame_returns;
+LONG g_modern_workspace_frame_calls = 0;
+LONG g_modern_workspace_frame_tints = 0;
+
+void construct_modern_workspace_frame_pen(void* pen, const void* color, std::uintptr_t caller) {
+  const auto original = reinterpret_cast<void(__cdecl*)(void*, const void*)>(g_modern_workspace_frame_hook.original_proc);
+  if (!original) {
+    return;
+  }
+  InterlockedIncrement(&g_modern_workspace_frame_calls);
+  alignas(16) unsigned char replacement[64] = {};
+  if (g_modern_workspace_dark && color && g_modern_workspace_paint_api.rgba &&
+      std::find(g_modern_workspace_frame_returns.begin(), g_modern_workspace_frame_returns.end(), caller) !=
+        g_modern_workspace_frame_returns.end()) {
+    const unsigned int rgba = g_modern_workspace_paint_api.rgba(color);
+    const unsigned int shade = (rgba >> 16) & 255;
+    if ((shade >= 128 || (rgba & 0xffffff) == 0x666666) &&
+      ((rgba >> 8) & 255) == shade && (rgba & 255) == shade) {
+      reinterpret_cast<QtColorRgbCtorFn>(resolve_qt_lookup().qcolor_rgb_ctor_proc)(replacement, 58, 58, 58, rgba >> 24);
+      color = replacement;
+      InterlockedIncrement(&g_modern_workspace_frame_tints);
+    }
+  }
+  original(pen, color);
+}
+
+void __cdecl modern_workspace_frame_pen_hook(void* pen, const void* color) {
+  construct_modern_workspace_frame_pen(pen, color, reinterpret_cast<std::uintptr_t>(_ReturnAddress()));
+}
+
+bool set_modern_workspace_frame_hook(bool enabled, HMODULE module) {
+  auto& hook = g_modern_workspace_frame_hook;
+  if (!enabled) {
+    if (hook.slot && *hook.slot == reinterpret_cast<void*>(&modern_workspace_frame_pen_hook)) {
+      DWORD protection = 0;
+      if (!VirtualProtect(hook.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+        return false;
+      }
+      *hook.slot = hook.original_proc;
+      DWORD unused = 0;
+      VirtualProtect(hook.slot, sizeof(void*), protection, &unused);
+    }
+    hook = {};
+    g_modern_workspace_frame_returns.clear();
+    return true;
+  }
+  if (hook.slot) {
+    return *hook.slot == reinterpret_cast<void*>(&modern_workspace_frame_pen_hook);
+  }
+  const auto calls = discover_modern_workspace_frame_calls(module ? module : GetModuleHandleW(L"kddockwidgets-qt6.dll"));
+  if (!calls.slot || calls.returns.size() != 2 || !*calls.slot) {
+    return false;
+  }
+  DWORD protection = 0;
+  if (!VirtualProtect(calls.slot, sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  hook = {calls.slot, *calls.slot};
+  g_modern_workspace_frame_returns = calls.returns;
+  InterlockedExchange(&g_modern_workspace_frame_calls, 0);
+  InterlockedExchange(&g_modern_workspace_frame_tints, 0);
+  *calls.slot = reinterpret_cast<void*>(&modern_workspace_frame_pen_hook);
+  DWORD unused = 0;
+  VirtualProtect(calls.slot, sizeof(void*), protection, &unused);
+  return true;
 }
 
 struct ContentBrowserImageFunctions {
@@ -8250,14 +9810,20 @@ bool is_legacy_material_folder(const LegacyMaterialLayout& layout, const void* r
       read_unaligned_pointer(data + layout.path_size_offset) != 0);
 }
 
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_material_image_builds = 0;
+#endif
+
 bool create_legacy_material_image(const void* source, void* result) {
-  const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
-  const auto width_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?width@QImage@@QEBAHXZ"));
-  const auto height_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?height@QImage@@QEBAHXZ"));
-  const auto format_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?format@QImage@@QEBA?AW4Format@1@XZ"));
-  const auto pixel_proc = reinterpret_cast<unsigned int(__cdecl*)(const void*, int, int)>(GetProcAddress(gui, "?pixel@QImage@@QEBAIHH@Z"));
-  const auto set_pixel = reinterpret_cast<void(__cdecl*)(void*, int, int, unsigned int)>(GetProcAddress(gui, "?setPixel@QImage@@QEAAXHHI@Z"));
-  const auto copy_proc = reinterpret_cast<void(__cdecl*)(void*, const void*)>(GetProcAddress(gui, "??0QImage@@QEAA@AEBV0@@Z"));
+  static const HMODULE gui = GetModuleHandleW(L"Qt6Gui.dll");
+  static const auto width_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?width@QImage@@QEBAHXZ"));
+  static const auto height_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?height@QImage@@QEBAHXZ"));
+  static const auto format_proc = reinterpret_cast<int(__cdecl*)(const void*)>(GetProcAddress(gui, "?format@QImage@@QEBA?AW4Format@1@XZ"));
+  static const auto pixel_proc = reinterpret_cast<unsigned int(__cdecl*)(const void*, int, int)>(GetProcAddress(gui, "?pixel@QImage@@QEBAIHH@Z"));
+  static const auto set_pixel = reinterpret_cast<void(__cdecl*)(void*, int, int, unsigned int)>(GetProcAddress(gui, "?setPixel@QImage@@QEAAXHHI@Z"));
+  static const auto copy_proc = reinterpret_cast<void(__cdecl*)(void*, const void*)>(GetProcAddress(gui, "??0QImage@@QEAA@AEBV0@@Z"));
+  static const auto read_row = reinterpret_cast<const unsigned char*(__cdecl*)(const void*, int)>(GetProcAddress(gui, "?constScanLine@QImage@@QEBAPEBEH@Z"));
+  static const auto write_row = reinterpret_cast<unsigned char*(__cdecl*)(void*, int)>(GetProcAddress(gui, "?scanLine@QImage@@QEAAPEAEH@Z"));
   if (!source || !result || !width_proc || !height_proc || !format_proc || !pixel_proc || !set_pixel || !copy_proc) {
     return false;
   }
@@ -8268,8 +9834,23 @@ bool create_legacy_material_image(const void* source, void* result) {
       (format != 4 && format != 5 && format != 6 && format != 13 && format != 29)) {
     return false;
   }
-  auto is_backing = [pixel_proc, source](int column, int row) {
-    const unsigned int pixel = pixel_proc(source, column, row);
+  std::vector<const unsigned char*> source_rows;
+  if (read_row && write_row) {
+    for (int row = 0; row < height; ++row) {
+      source_rows.push_back(read_row(source, row));
+    }
+  }
+  auto is_backing = [&](int column, int row) {
+    unsigned int pixel = 0;
+    if (source_rows.empty()) {
+      pixel = pixel_proc(source, column, row);
+    } else if (format == 13 || format == 29) {
+      const auto* channels = source_rows[row] + column * 3;
+      pixel = 0xff000000u | (static_cast<unsigned int>(channels[format == 13 ? 0 : 2]) << 16) |
+        (static_cast<unsigned int>(channels[1]) << 8) | channels[format == 13 ? 2 : 0];
+    } else {
+      std::memcpy(&pixel, source_rows[row] + column * 4, sizeof(pixel));
+    }
     const int red = (pixel >> 16) & 255;
     const int green = (pixel >> 8) & 255;
     const int blue = pixel & 255;
@@ -8281,8 +9862,18 @@ bool create_legacy_material_image(const void* source, void* result) {
     return false;
   }
   copy_proc(result, source);
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_material_image_builds;
+#endif
+  std::vector<unsigned char*> destination_rows;
+  if (!source_rows.empty()) {
+    for (int row = 0; row < height; ++row) {
+      destination_rows.push_back(write_row(result, row));
+    }
+  }
   std::vector<unsigned char> visited(static_cast<size_t>(width) * height);
   std::vector<size_t> pending;
+  pending.reserve(static_cast<size_t>(width) * height);
   auto add = [&](int column, int row) {
     if (column < 0 || row < 0 || column >= width || row >= height) {
       return;
@@ -8306,7 +9897,14 @@ bool create_legacy_material_image(const void* source, void* result) {
   for (size_t index = 0; index < pending.size(); ++index) {
     const int column = static_cast<int>(pending[index] % width);
     const int row = static_cast<int>(pending[index] / width);
-    set_pixel(result, column, row, 0xff2b2b2b);
+    if (destination_rows.empty()) {
+      set_pixel(result, column, row, 0xff2b2b2b);
+    } else if (format == 13 || format == 29) {
+      std::memset(destination_rows[row] + column * 3, 43, 3);
+    } else {
+      const unsigned int color = 0xff2b2b2bu;
+      std::memcpy(destination_rows[row] + column * 4, &color, sizeof(color));
+    }
     add(column - 1, row);
     add(column + 1, row);
     add(column, row - 1);
@@ -8322,9 +9920,14 @@ thread_local bool g_legacy_material_folder_scope = false;
 struct LegacyMaterialImageCache {
   long long key = 0;
   bool constructed = false;
+  size_t bytes = 0;
+  std::uint64_t age = 0;
   alignas(16) unsigned char image[256] = {};
 };
 std::vector<std::unique_ptr<LegacyMaterialImageCache>> g_legacy_material_images;
+size_t g_legacy_material_bytes = 0;
+std::uint64_t g_legacy_material_age = 0;
+constexpr size_t legacy_material_budget = 16 * 1024 * 1024;
 
 using LegacyMaterialRowFn = void(__cdecl*)(void*, void*, void*, const void*);
 
@@ -8344,7 +9947,7 @@ bool draw_legacy_material_image(void* painter, const void* rect, const void* ima
   if (!g_legacy_material_folder_scope || !g_legacy_material_image_return || caller != g_legacy_material_image_return) {
     return false;
   }
-  const auto cache_key = reinterpret_cast<long long(__cdecl*)(const void*)>(
+  static const auto cache_key = reinterpret_cast<long long(__cdecl*)(const void*)>(
     GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?cacheKey@QImage@@QEBA_JXZ"));
   const long long key = cache_key ? cache_key(image) : 0;
   if (!key) {
@@ -8353,18 +9956,27 @@ bool draw_legacy_material_image(void* painter, const void* rect, const void* ima
   auto found = std::find_if(g_legacy_material_images.begin(), g_legacy_material_images.end(),
     [key](const auto& cached) { return cached->key == key; });
   if (found == g_legacy_material_images.end()) {
-    if (g_legacy_material_images.size() >= 32) {
-      if (g_legacy_material_images.front()->constructed) {
-        reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)(g_legacy_material_images.front()->image);
-      }
-      g_legacy_material_images.erase(g_legacy_material_images.begin());
-    }
     auto cached = std::make_unique<LegacyMaterialImageCache>();
     cached->key = key;
     cached->constructed = create_legacy_material_image(image, cached->image);
+    static const auto image_bytes = reinterpret_cast<long long(__cdecl*)(const void*)>(
+      GetProcAddress(GetModuleHandleW(L"Qt6Gui.dll"), "?sizeInBytes@QImage@@QEBA_JXZ"));
+    cached->bytes = cached->constructed ? (image_bytes ? static_cast<size_t>(image_bytes(cached->image)) : 1024 * 1024) : 0;
+    while (!g_legacy_material_images.empty() &&
+        (g_legacy_material_images.size() >= 512 || g_legacy_material_bytes + cached->bytes > legacy_material_budget)) {
+      const auto oldest = std::min_element(g_legacy_material_images.begin(), g_legacy_material_images.end(),
+        [](const auto& first, const auto& second) { return first->age < second->age; });
+      if ((*oldest)->constructed) {
+        reinterpret_cast<void(__cdecl*)(void*)>(g_toolbar_title_api.image_destructor)((*oldest)->image);
+      }
+      g_legacy_material_bytes -= (*oldest)->bytes;
+      g_legacy_material_images.erase(oldest);
+    }
+    g_legacy_material_bytes += cached->bytes;
     g_legacy_material_images.push_back(std::move(cached));
     found = g_legacy_material_images.end() - 1;
   }
+  (*found)->age = ++g_legacy_material_age;
   if (!(*found)->constructed) {
     return false;
   }
@@ -8382,6 +9994,7 @@ bool set_legacy_material_image_hook(const QtLookup& lookup, bool dark) {
       }
     }
     g_legacy_material_images.clear();
+    g_legacy_material_bytes = 0;
     if (!g_legacy_material_row_hook.slot) {
       return true;
     }
@@ -8735,11 +10348,14 @@ void __cdecl content_browser_qimage_fill_color_hook(void* image, const void* col
     g_content_browser_resource_image_renderer_begin && g_content_browser_resource_image_renderer_end &&
     return_address >= g_content_browser_resource_image_renderer_begin &&
     return_address < g_content_browser_resource_image_renderer_end;
-  const bool image_generator_on_stack = resource_image_renderer && content_browser_image_generator_on_stack();
+  if (!g_content_browser_text_dark || !resource_image_renderer) {
+    g_content_browser_qimage_fill_color_proc(image, color);
+    return;
+  }
   const unsigned int rgb = color && g_content_browser_qcolor_rgb_proc
     ? g_content_browser_qcolor_rgb_proc(color) & 0x00ffffffu
-    : 0xffffffffu;  const bool resource_image_fill = g_content_browser_text_dark && resource_image_renderer && image_generator_on_stack;
-  const bool white = resource_image_fill && rgb == 0x00ffffffu;
+    : 0xffffffffu;
+  const bool white = rgb == 0x00ffffffu && content_browser_image_generator_on_stack();
   if (white && g_content_browser_qcolor_rgb_ctor_proc) {
     alignas(16) unsigned char dark_color_storage[64] = {};
     g_content_browser_qcolor_rgb_ctor_proc(dark_color_storage, 43, 43, 43, 255);
@@ -9308,6 +10924,7 @@ using EntityInfoInputPaintFn = void(__fastcall*)(void*, void*);
 struct EntityInfoInputPaintHook {
   void** slot = nullptr;
   void* original_proc = nullptr;
+  const void* vtable = nullptr;
 };
 
 std::vector<EntityInfoInputPaintHook> g_entity_info_input_paint_hooks;
@@ -9316,14 +10933,25 @@ LONG g_entity_info_input_paint_hook_invocation_count = 0;
 thread_local bool g_entity_info_input_palette_applying = false;
 
 bool is_entity_info_input_widget(const QtLookup& lookup, void* widget) {
+  static const auto tables = find_vtables_for_type(".?AVCEntityInfoDlg@@");
+  if (tables.empty()) {
+    return false;
+  }
   for (int depth = 0; widget && depth < 16; ++depth) {
-    if (msvc_rtti_type_name(widget) == ".?AVCEntityInfoDlg@@") {
+    if (!memory_readable(widget, sizeof(void*))) {
+      return false;
+    }
+    if (std::find(tables.begin(), tables.end(), *static_cast<const void* const*>(widget)) != tables.end()) {
       return true;
     }
     widget = qwidget_parent_widget(lookup, widget);
   }
   return false;
 }
+
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_entity_palette_preparations = 0;
+#endif
 
 bool apply_entity_info_line_edit_palette(const QtLookup& lookup, void* widget, bool dark) {
   if (!widget || !lookup.widget_palette_proc || !lookup.widget_set_palette_proc || !lookup.qpalette_copy_ctor_proc ||
@@ -9338,6 +10966,12 @@ bool apply_entity_info_line_edit_palette(const QtLookup& lookup, void* widget, b
   using QtPaletteReturnFn = void(__cdecl*)(void*, const void*);
   using QtPaletteDestructorFn = void(__cdecl*)(void*);
 
+  if (dark && widget_theme_stamp(lookup, widget, "_darkmode_entity_palette", false)) {
+    return true;
+  }
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_entity_palette_preparations;
+#endif
   alignas(16) unsigned char palette_storage[256] = {};
   if (!dark && lookup.app_palette_widget_proc) {
     reinterpret_cast<QtPaletteReturnFn>(lookup.app_palette_widget_proc)(palette_storage, widget);
@@ -9361,6 +10995,9 @@ bool apply_entity_info_line_edit_palette(const QtLookup& lookup, void* widget, b
 
   reinterpret_cast<QtWidgetSetPaletteFn>(lookup.widget_set_palette_proc)(widget, palette_storage);
   reinterpret_cast<QtPaletteDestructorFn>(lookup.qpalette_destructor_proc)(palette_storage);
+  if (dark) {
+    widget_theme_stamp(lookup, widget, "_darkmode_entity_palette", true);
+  }
   return true;
 }
 
@@ -9387,6 +11024,10 @@ QtFocusReturnerLineEdit:read-only {
   selection-color: #d8dbe2;
 }
 )QSS" : "";
+  std::string current;
+  if (read_omnibar_stylesheet(lookup, widget, current) && current == stylesheet) {
+    return true;
+  }
   alignas(16) unsigned char qstring_storage[256] = {};
   const size_t stylesheet_length = std::strlen(stylesheet);
   if (lookup.from_utf8_symbol.find("_J") != std::string::npos) {
@@ -9438,13 +11079,9 @@ EntityInfoInputPaintFn original_entity_info_input_paint_proc(void* widget) {
   if (!vtable) {
     return nullptr;
   }
-  for (size_t slot_index = 0; slot_index < 96; ++slot_index) {
-    void** slot = &vtable[slot_index];
-    const auto hook = std::find_if(g_entity_info_input_paint_hooks.begin(), g_entity_info_input_paint_hooks.end(), [slot](const EntityInfoInputPaintHook& entry) {
-      return entry.slot == slot;
-    });
-    if (hook != g_entity_info_input_paint_hooks.end()) {
-      return reinterpret_cast<EntityInfoInputPaintFn>(hook->original_proc);
+  for (const auto& hook : g_entity_info_input_paint_hooks) {
+    if (hook.vtable == vtable) {
+      return reinterpret_cast<EntityInfoInputPaintFn>(hook.original_proc);
     }
   }
   return nullptr;
@@ -9513,7 +11150,7 @@ bool install_entity_info_input_paint_hooks(const QtLookup& lookup) {
       *slot = reinterpret_cast<void*>(&entity_info_input_paint_hook);
       DWORD unused_protection = 0;
       VirtualProtect(slot, sizeof(*slot), original_protection, &unused_protection);
-      g_entity_info_input_paint_hooks.push_back({slot, original_proc});
+      g_entity_info_input_paint_hooks.push_back({slot, original_proc, vtable});
       installed += 1;
     }
   }
@@ -9628,29 +11265,23 @@ QtFocusReturnerLineEdit:disabled {
   return dialogs.size();
 }
 
-std::vector<void*> find_overlays_dialog_widgets(const QtLookup& lookup) {
+std::vector<void*> find_overlays_dialog_widgets(
+  const QtLookup& lookup,
+  const std::vector<const void*>& vtables = find_vtables_for_type(".?AVCModelServiceDialog@@")
+) {
   std::vector<void*> matches;
-  const std::vector<const void*> vtables = find_vtables_for_type(".?AVCModelServiceDialog@@");
-  if (!lookup.object_children_proc) {
-    return matches;
-  }
-
-  std::string main_window_description;
-  void* main_window = find_main_window_qwidget(lookup, main_window_description);
-  if (!main_window) {
+  if (!lookup.app_all_widgets_proc || vtables.empty()) {
     return matches;
   }
 
   std::vector<void*> widgets;
-  std::unordered_set<std::uintptr_t> visited;
-  collect_qwidget_descendants_from_qobject(lookup, main_window, 0, 32, widgets, 1200, visited, "Overlays dialog", true);
+  static_cast<void>(dump_qwidget_list_return(lookup.app_all_widgets_proc, widgets, static_cast<size_t>(-1)));
   for (void* widget : widgets) {
     if (!pointer_looks_like_cpp_object(widget)) {
       continue;
     }
     const void* vtable = *reinterpret_cast<const void* const*>(widget);
-    if (std::find(vtables.begin(), vtables.end(), vtable) != vtables.end() ||
-        msvc_rtti_type_name(widget) == ".?AVCModelServiceDialog@@") {
+    if (std::find(vtables.begin(), vtables.end(), vtable) != vtables.end()) {
       add_unique_pointer(matches, widget);
     }
   }
@@ -9803,6 +11434,10 @@ size_t apply_component_navigator_tree_palette(const QtLookup& lookup, bool dark,
   return applied;
 }
 
+#if defined(DARKMODE_RUNTIME_TESTING)
+size_t g_test_vcb_palette_preparations = 0;
+#endif
+
 bool apply_vcb_edit_palette(const QtLookup& lookup, void* widget, bool dark) {
   if (!widget || !lookup.widget_set_palette_proc || !lookup.widget_palette_proc || !lookup.qpalette_copy_ctor_proc || !lookup.qpalette_destructor_proc) {
     return false;
@@ -9815,6 +11450,12 @@ bool apply_vcb_edit_palette(const QtLookup& lookup, void* widget, bool dark) {
   using QtPaletteReturnFn = void(__cdecl*)(void*, const void*);
   using QtPaletteDestructorFn = void(__cdecl*)(void*);
 
+  if (dark && widget_theme_stamp(lookup, widget, "_darkmode_vcb_palette", false)) {
+    return true;
+  }
+#if defined(DARKMODE_RUNTIME_TESTING)
+  ++g_test_vcb_palette_preparations;
+#endif
   alignas(16) unsigned char palette_storage[256] = {};
   if (!dark && lookup.app_palette_widget_proc) {
     reinterpret_cast<QtPaletteReturnFn>(lookup.app_palette_widget_proc)(palette_storage, widget);
@@ -9849,6 +11490,9 @@ bool apply_vcb_edit_palette(const QtLookup& lookup, void* widget, bool dark) {
 
   reinterpret_cast<QtWidgetSetPaletteFn>(lookup.widget_set_palette_proc)(widget, palette_storage);
   reinterpret_cast<QtPaletteDestructorFn>(lookup.qpalette_destructor_proc)(palette_storage);
+  if (dark) {
+    widget_theme_stamp(lookup, widget, "_darkmode_vcb_palette", true);
+  }
   return true;
 }
 
@@ -9880,7 +11524,8 @@ void __fastcall vcb_edit_paint_hook(void* widget, void* event) {
   if (g_vcb_edit_paint_dark) {
     static_cast<void>(apply_vcb_edit_palette(resolve_qt_lookup(), widget, true));
   }
-  auto* typed_input_background = reinterpret_cast<unsigned char*>(widget) + kVcbEditTypedInputBackgroundOffset;
+  const size_t background_offset = modern_workspace_types().empty() ? kVcbEditTypedInputBackgroundOffset : 0x48;
+  auto* typed_input_background = reinterpret_cast<unsigned char*>(widget) + background_offset;
   const bool suppress_direct_white = g_vcb_edit_paint_dark && memory_readable(typed_input_background, sizeof(*typed_input_background));
   unsigned char original_typed_input_background = 0;
   if (suppress_direct_white) {
@@ -10203,6 +11848,15 @@ bool is_model_services_url(const CefString* url) {
   return is_model_services_url(cef_string_ascii_lower(url));
 }
 
+bool is_extension_manager_url(const std::string& url) {
+  const std::string lower = lower_ascii(url);
+  const size_t end = lower.find_first_of("?#");
+  const std::string path = lower.substr(0, end);
+  constexpr char suffix[] = "/dialogs/extensionmanager/extension_manager.html";
+  return path.compare(0, 7, "file://") == 0 && path.size() >= sizeof(suffix) - 1 &&
+    path.compare(path.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) == 0;
+}
+
 std::string cef_frame_url_lower(CefFrame* frame) {
   if (!frame || !cef_struct_has_member(&frame->base, offsetof(CefFrame, get_url) + sizeof(frame->get_url)) || !frame->get_url) {
     return "";
@@ -10238,8 +11892,473 @@ std::u16string utf16_from_ascii(const char* value) {
 
 const char* model_services_style_script(bool enabled) {
   return enabled
-    ? R"DARKMODE((function(){var key='__darkModeSkpModelServicesObserver';var probeKey='__darkModeSkpModelServicesProbe';if(!window[probeKey]){window[probeKey]=true;if(window.sketchup&&typeof window.sketchup.get_l10n_strings==='function'){window.sketchup.get_l10n_strings({onCompleted:function(){}});}}var apply=function(){var background='rgb(43,43,43)';var headerBackground='rgb(48,48,48)';var divider='rgb(68,68,68)';var text='rgb(216,219,226)';var muted='rgb(160,164,172)';var roots=[document.documentElement,document.body,document.getElementById('app')];for(var rootIndex=0;rootIndex<roots.length;rootIndex++){var root=roots[rootIndex];if(root){root.style.setProperty('background-color',background,'important');root.style.setProperty('color',text,'important');}}var rows=document.querySelectorAll('.list-group.list-group-condensed .list-group-item');for(var rowIndex=0;rowIndex<rows.length;rowIndex++){rows[rowIndex].style.setProperty('background-color',background,'important');rows[rowIndex].style.setProperty('color',text,'important');}var header=document.querySelector('.su-service-header');if(header){header.style.setProperty('background-color',headerBackground,'important');header.style.setProperty('border-bottom-color',divider,'important');header.style.setProperty('color',text,'important');}var headerCells=document.querySelectorAll('.su-service-header .align-items-center > div');for(var headerIndex=0;headerIndex<headerCells.length;headerIndex++){headerCells[headerIndex].style.setProperty('background-color',headerBackground,'important');headerCells[headerIndex].style.setProperty('border-left-color',divider,'important');headerCells[headerIndex].style.setProperty('border-right-color',divider,'important');headerCells[headerIndex].style.setProperty('color',text,'important');}var mutedItems=document.querySelectorAll('.su-source,.su-drag-handle span');for(var mutedIndex=0;mutedIndex<mutedItems.length;mutedIndex++){mutedItems[mutedIndex].style.setProperty('color',muted,'important');}};window.setTimeout(function(){apply();if(!window[key]&&window.MutationObserver&&document.body){var observer=new MutationObserver(function(){apply();});observer.observe(document.body,{childList:true,subtree:true});window[key]=observer;}},0);})();)DARKMODE"
-    : R"DARKMODE((function(){var key='__darkModeSkpModelServicesObserver';if(window[key]){window[key].disconnect();window[key]=null;}var roots=[document.documentElement,document.body,document.getElementById('app')];for(var rootIndex=0;rootIndex<roots.length;rootIndex++){var root=roots[rootIndex];if(root){root.style.removeProperty('background-color');root.style.removeProperty('color');}}var items=document.querySelectorAll('.list-group.list-group-condensed .list-group-item,.su-service-header,.su-service-header .align-items-center > div,.su-source,.su-drag-handle span');for(var itemIndex=0;itemIndex<items.length;itemIndex++){items[itemIndex].style.removeProperty('background-color');items[itemIndex].style.removeProperty('border-bottom-color');items[itemIndex].style.removeProperty('border-left-color');items[itemIndex].style.removeProperty('border-right-color');items[itemIndex].style.removeProperty('color');}})();)DARKMODE";
+    ? R"DARKMODE((function(){
+      var probeKey='__darkModeSkpModelServicesProbe';
+      if(!window[probeKey]){
+        window[probeKey]=true;
+        if(window.sketchup&&typeof window.sketchup.get_l10n_strings==='function'){
+          window.sketchup.get_l10n_strings({onCompleted:function(){}});
+        }
+      }
+      var key='__darkModeSkpModelServicesStyle';
+      var root=document.head||document.documentElement;
+      if(!root||document.getElementById(key)){return;}
+      var style=document.createElement('style');
+      style.id=key;
+      style.textContent=
+        'html,body,#app,.list-group.list-group-condensed .list-group-item{background-color:rgb(43,43,43)!important;color:rgb(216,219,226)!important;}' +
+        '.su-service-header{background-color:rgb(48,48,48)!important;border-bottom-color:rgb(68,68,68)!important;color:rgb(216,219,226)!important;}' +
+        '.su-service-header .align-items-center > div{background-color:rgb(48,48,48)!important;border-left-color:rgb(68,68,68)!important;border-right-color:rgb(68,68,68)!important;color:rgb(216,219,226)!important;}' +
+        '.su-source,.su-drag-handle span{color:rgb(160,164,172)!important;}';
+      root.appendChild(style);
+    })();)DARKMODE"
+    : R"DARKMODE((function(){
+      var style=document.getElementById('__darkModeSkpModelServicesStyle');
+      if(style&&style.parentNode){style.parentNode.removeChild(style);}
+    })();)DARKMODE";
+}
+
+constexpr const char* k_extension_manager_ui_icons[] = {
+  "dlg_blue_check_mark", "dlg_settings", "dlg_help", "dlg_expand_less", "dlg_expand_more",
+  "dlg_xMark", "dlg_sign_in", "dlg_selectall", "dlg_deselectall"
+};
+
+std::string extension_manager_icon_svg(const std::string& alias, std::string svg) {
+  if (std::find(std::begin(k_extension_manager_ui_icons), std::end(k_extension_manager_ui_icons), alias) ==
+      std::end(k_extension_manager_ui_icons)) {
+    return svg;
+  }
+  const size_t root = svg.find("<svg");
+  if (root == std::string::npos) {
+    return {};
+  }
+  for (const char* attribute : {"fill", "stroke"}) {
+    for (const char quote : {'\'', '"'}) {
+      for (const std::string tone : {"#000", "#000000", "#333333", "#4a4a4a", "#cccccc", "#005f9e", "#144689"}) {
+        const bool blue = tone == "#005f9e" || tone == "#144689";
+        const char* ink = alias == "dlg_blue_check_mark" ? "#ffffff" : blue ? "#4772b3" : "#d8dbe2";
+        const std::string original = std::string(attribute) + '=' + quote + tone + quote;
+        const std::string replacement = std::string(attribute) + '=' + quote + ink + quote;
+        size_t offset = 0;
+        while ((offset = lower_ascii(svg).find(original, offset)) != std::string::npos) {
+          svg.replace(offset, original.size(), replacement);
+          offset += replacement.size();
+        }
+      }
+    }
+  }
+  if (alias == "dlg_sign_in") {
+    svg.insert(root + 4, " fill=\"#d8dbe2\"");
+  }
+  return svg;
+}
+
+std::string extension_manager_qml_source(std::string source, const std::vector<std::string>& ui_icons = {}) {
+  const auto replace = [&](const std::string& before, const std::string& after) {
+    size_t offset = 0;
+    while ((offset = source.find(before, offset)) != std::string::npos) {
+      source.replace(offset, before.size(), after);
+      offset += after.size();
+    }
+  };
+  for (const auto& alias : ui_icons) {
+    const std::string original = "\"image://ui/" + alias + "\"";
+    replace(original, "(__darkModeSkpPalette.window.hslLightness < 0.5 ? \"qrc:/__darkmode_skp_extension_manager/" +
+      alias + ".svg\" : " + original + ")");
+  }
+  if (source.find("extension_selected ? \"white\"") != std::string::npos) {
+    replace("color: root.fontColor", "color: (__darkModeSkpPalette.window.hslLightness < 0.5 && "
+      "typeof extension_selected !== \"undefined\" && extension_selected) ? \"white\" : root.fontColor");
+  }
+  replace("case Button.ButtonType.Warning:\n            \"#000000\";",
+    "case Button.ButtonType.Warning:\n            \"black\";");
+  replace("background: Rectangle {\n        color: \"white\"",
+    "background: Rectangle {\n        color: (__darkModeSkpPalette.window.hslLightness < 0.5 ? \"#303030\" : \"white\")");
+  replace("color: tbDiscard.hovered ? \"#e6e6e6\" : \"white\"",
+    "color: tbDiscard.hovered ? \"#e6e6e6\" : (__darkModeSkpPalette.window.hslLightness < 0.5 ? \"#303030\" : \"white\")");
+  const std::pair<const char*, const char*> colors[] = {
+    {"#f3f3f7", "#2b2b2b"}, {"#f9f9fb", "#303030"}, {"#e2e2e7", "#242424"},
+    {"#e6e6e6", "#444444"}, {"#d2d2d2", "#555555"}, {"#d0d0d7", "#444444"},
+    {"#787878", "#d8dbe2"}, {"#727272", "#d8dbe2"}, {"#979797", "#555555"},
+    {"#1a1a1a", "#709ce6"}, {"#000000", "#f0f2f7"},
+    {"#005f9e", "#4772b3"}, {"#00548c", "#4772b3"}, {"#2d7bb8", "#4772b3"},
+    {"#4a90e2", "#4772b3"}, {"#197cb6", "#5684c4"}, {"#00406b", "#5684c4"},
+    {"#002b46", "#385b8f"}, {"#002b47", "#385b8f"},
+    {"#4a92e2", "#709ce6"}, {"#003152", "#98bdf0"},
+    {"#aeaeb6", "#555555"}, {"#8c8c8c", "#a5abb5"}
+  };
+  for (const auto& color : colors) {
+    for (const char quote : {'\'', '"'}) {
+      const std::string original = std::string(1, quote) + color.first + quote;
+      replace(original, "(__darkModeSkpPalette.window.hslLightness < 0.5 ? \"" +
+        std::string(color.second) + "\" : " + original + ")");
+    }
+  }
+  for (const auto& expression : {std::make_pair("extension_selected ? \"white\"", "#4772b3"),
+      std::make_pair("cancelBtnHoveredColor : \"white\"", "#383838")}) {
+    const std::string native = expression.first;
+    const size_t white = native.find("\"white\"");
+    replace(native, native.substr(0, white) + "(__darkModeSkpPalette.window.hslLightness < 0.5 ? \"" +
+      expression.second + "\" : \"white\")");
+  }
+  if (source.find("__darkModeSkpPalette") == std::string::npos) {
+    return source;
+  }
+  const size_t root = source.find('{');
+  if (root == std::string::npos || source.find("import QtQuick") == std::string::npos) {
+    return {};
+  }
+  source.insert(root + 1, "\n    readonly property SystemPalette __darkModeSkpPalette: SystemPalette {}\n");
+  return source;
+}
+
+struct ExtensionManagerQmlApi {
+  using Destroy = void(__cdecl*)(void*);
+  using ReturnValue = void*(__cdecl*)(const void*, void*);
+  void(__cdecl* string_create)(void*, const char*, long long) = nullptr;
+  Destroy string_destroy = nullptr;
+  ReturnValue string_bytes = nullptr;
+  Destroy bytes_destroy = nullptr;
+  const char*(__cdecl* bytes_data)(const void*) = nullptr;
+  long long(__cdecl* bytes_size)(const void*) = nullptr;
+  void(__cdecl* locale_create)(void*) = nullptr;
+  Destroy locale_destroy = nullptr;
+  void(__cdecl* resource_create)(void*, const void*, const void*) = nullptr;
+  Destroy resource_destroy = nullptr;
+  ReturnValue resource_bytes = nullptr;
+  void(__cdecl* iterator_create)(void*, const void*, unsigned int) = nullptr;
+  Destroy iterator_destroy = nullptr;
+  bool(__cdecl* iterator_has_next)(const void*) = nullptr;
+  void*(__cdecl* iterator_next)(void*, void*) = nullptr;
+  bool(__cdecl* register_data)(int, const void*, const void*, const void*) = nullptr;
+  bool(__cdecl* unregister_data)(int, const void*, const void*, const void*) = nullptr;
+  void*(__cdecl* url_bytes)(const void*, void*, int) = nullptr;
+  void(__cdecl* url_create)(void*, const void*, int) = nullptr;
+  Destroy url_destroy = nullptr;
+
+  bool ready() const {
+    return string_create && string_destroy && string_bytes && bytes_destroy && bytes_data && bytes_size &&
+      locale_create && locale_destroy && resource_create && resource_destroy && resource_bytes &&
+      iterator_create && iterator_destroy && iterator_has_next && iterator_next && register_data && unregister_data &&
+      url_bytes && url_create && url_destroy;
+  }
+  std::string take_bytes(void* bytes) const {
+    const long long size = bytes_size(bytes);
+    const char* data = bytes_data(bytes);
+    std::string result;
+    if (size > 0 && size <= 4 * 1024 * 1024 && memory_readable(data, static_cast<size_t>(size))) {
+      result.assign(data, static_cast<size_t>(size));
+    }
+    bytes_destroy(bytes);
+    return result;
+  }
+  std::string read(const std::string& path) const {
+    if (!ready()) {
+      return {};
+    }
+    alignas(16) unsigned char name[64] = {}, locale[64] = {}, resource[256] = {}, bytes[64] = {};
+    string_create(name, path.data(), static_cast<long long>(path.size()));
+    locale_create(locale);
+    resource_create(resource, name, locale);
+    resource_bytes(resource, bytes);
+    auto result = take_bytes(bytes);
+    resource_destroy(resource);
+    locale_destroy(locale);
+    string_destroy(name);
+    return result;
+  }
+};
+
+const ExtensionManagerQmlApi& extension_manager_qml_api() {
+  static const ExtensionManagerQmlApi api = [] {
+    ExtensionManagerQmlApi value;
+    const auto& lookup = resolve_qt_lookup();
+    value.string_create = reinterpret_cast<decltype(value.string_create)>(lookup.from_utf8_proc);
+    value.string_destroy = reinterpret_cast<decltype(value.string_destroy)>(lookup.qstring_destructor_proc);
+    value.bytes_destroy = reinterpret_cast<decltype(value.bytes_destroy)>(lookup.qbytearray_destructor_proc);
+    value.bytes_data = reinterpret_cast<decltype(value.bytes_data)>(lookup.qbytearray_const_data_proc);
+    value.bytes_size = reinterpret_cast<decltype(value.bytes_size)>(lookup.qbytearray_size_proc);
+    HMODULE core = GetModuleHandleW(L"Qt6Core.dll");
+    value.string_bytes = reinterpret_cast<decltype(value.string_bytes)>(lookup.qstring_to_utf8_proc);
+    value.locale_create = reinterpret_cast<decltype(value.locale_create)>(GetProcAddress(core, "??0QLocale@@QEAA@XZ"));
+    value.locale_destroy = reinterpret_cast<decltype(value.locale_destroy)>(GetProcAddress(core, "??1QLocale@@QEAA@XZ"));
+    value.resource_create = reinterpret_cast<decltype(value.resource_create)>(GetProcAddress(core, "??0QResource@@QEAA@AEBVQString@@AEBVQLocale@@@Z"));
+    value.resource_destroy = reinterpret_cast<decltype(value.resource_destroy)>(GetProcAddress(core, "??1QResource@@QEAA@XZ"));
+    value.resource_bytes = reinterpret_cast<decltype(value.resource_bytes)>(GetProcAddress(core, "?uncompressedData@QResource@@QEBA?AVQByteArray@@XZ"));
+    value.iterator_create = reinterpret_cast<decltype(value.iterator_create)>(GetProcAddress(core, "??0QDirIterator@@QEAA@AEBVQString@@V?$QFlags@W4IteratorFlag@QDirIterator@@@@@Z"));
+    value.iterator_destroy = reinterpret_cast<decltype(value.iterator_destroy)>(GetProcAddress(core, "??1QDirIterator@@QEAA@XZ"));
+    value.iterator_has_next = reinterpret_cast<decltype(value.iterator_has_next)>(GetProcAddress(core, "?hasNext@QDirIterator@@QEBA_NXZ"));
+    value.iterator_next = reinterpret_cast<decltype(value.iterator_next)>(GetProcAddress(core, "?next@QDirIterator@@QEAA?AVQString@@XZ"));
+    value.register_data = reinterpret_cast<decltype(value.register_data)>(GetProcAddress(core, "?qRegisterResourceData@@YA_NHPEBE00@Z"));
+    value.unregister_data = reinterpret_cast<decltype(value.unregister_data)>(GetProcAddress(core, "?qUnregisterResourceData@@YA_NHPEBE00@Z"));
+    value.url_bytes = reinterpret_cast<decltype(value.url_bytes)>(GetProcAddress(core, "?toEncoded@QUrl@@QEBA?AVQByteArray@@V?$QUrlTwoFlags@W4UrlFormattingOption@QUrl@@W4ComponentFormattingOption@2@@@@Z"));
+    value.url_create = reinterpret_cast<decltype(value.url_create)>(GetProcAddress(core, "??0QUrl@@QEAA@AEBVQString@@W4ParsingMode@0@@Z"));
+    value.url_destroy = reinterpret_cast<decltype(value.url_destroy)>(GetProcAddress(core, "??1QUrl@@QEAA@XZ"));
+    return value;
+  }();
+  return api;
+}
+
+struct ExtensionManagerQmlResources {
+  std::vector<unsigned char> tree, names, data;
+  bool registered = false;
+  ~ExtensionManagerQmlResources() {
+    if (registered && GetModuleHandleW(L"Qt6Core.dll")) {
+      extension_manager_qml_api().unregister_data(1, tree.data(), names.data(), data.data());
+    }
+  }
+};
+
+std::unique_ptr<ExtensionManagerQmlResources> create_extension_manager_qml_resources() {
+  const auto& api = extension_manager_qml_api();
+  if (!api.ready() || api.read(":/dialogs/ExtensionManagerDialog.qml").empty()) {
+    return {};
+  }
+  struct Node {
+    std::string name, content;
+    std::vector<size_t> children;
+    unsigned int hash = 0;
+    size_t index = 0;
+    bool file = false;
+  };
+  std::vector<Node> nodes(1);
+  alignas(16) unsigned char directory[64] = {}, iterator[256] = {};
+  api.string_create(directory, ":/dialogs", 9);
+  api.iterator_create(iterator, directory, 2);
+  size_t count = 0, total = 0;
+  size_t icon_index = 0;
+  std::vector<std::string> ui_icons;
+  bool complete = true;
+  while (icon_index < std::size(k_extension_manager_ui_icons) || api.iterator_has_next(iterator)) {
+    const bool control_icon = icon_index < std::size(k_extension_manager_ui_icons);
+    std::string path;
+    if (control_icon) {
+      path = std::string(":/") + k_extension_manager_ui_icons[icon_index++];
+    } else {
+      alignas(16) unsigned char name[64] = {}, bytes[64] = {};
+      api.iterator_next(iterator, name);
+      api.string_bytes(name, bytes);
+      path = api.take_bytes(bytes);
+      api.string_destroy(name);
+    }
+    if (++count > 4096 || (!control_icon && path.rfind(":/dialogs/", 0) != 0) ||
+        std::any_of(path.begin(), path.end(), [](unsigned char character) { return character >= 128; })) {
+      complete = false;
+      break;
+    }
+    std::string content = api.read(path);
+    if (content.empty()) {
+      continue;
+    }
+    if (control_icon) {
+      content = extension_manager_icon_svg(path.substr(2), std::move(content));
+      if (content.empty()) {
+        continue;
+      }
+      ui_icons.push_back(path.substr(2));
+    }
+    if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".qml") == 0) {
+      content = extension_manager_qml_source(std::move(content), ui_icons);
+      if (content.empty()) {
+        complete = false;
+        break;
+      }
+    }
+    total += content.size();
+    if (total > 16 * 1024 * 1024) {
+      complete = false;
+      break;
+    }
+    const std::string private_path = "__darkmode_skp_extension_manager" + path.substr(1) + (control_icon ? ".svg" : "");
+    size_t parent = 0, start = 0;
+    while (start < private_path.size()) {
+      const size_t slash = private_path.find('/', start);
+      const std::string part = private_path.substr(start, slash == std::string::npos ? slash : slash - start);
+      size_t child = nodes.size();
+      for (size_t candidate : nodes[parent].children) {
+        if (nodes[candidate].name == part) {
+          child = candidate;
+          break;
+        }
+      }
+      if (child == nodes.size()) {
+        nodes[parent].children.push_back(child);
+        Node entry;
+        entry.name = part;
+        for (unsigned char character : part) {
+          entry.hash = (entry.hash << 4) + character;
+          entry.hash ^= (entry.hash & 0xf0000000u) >> 23;
+          entry.hash &= 0x0fffffffu;
+        }
+        nodes.push_back(std::move(entry));
+      }
+      parent = child;
+      if (slash == std::string::npos) {
+        nodes[parent].file = true;
+        nodes[parent].content = std::move(content);
+        break;
+      }
+      start = slash + 1;
+    }
+  }
+  api.iterator_destroy(iterator);
+  api.string_destroy(directory);
+  if (!complete || nodes.size() == 1) {
+    return {};
+  }
+  std::vector<size_t> order{0};
+  for (size_t position = 0; position < order.size(); ++position) {
+    auto& children = nodes[order[position]].children;
+    std::sort(children.begin(), children.end(), [&](size_t left, size_t right) { return nodes[left].hash < nodes[right].hash; });
+    for (size_t child : children) {
+      nodes[child].index = order.size();
+      order.push_back(child);
+    }
+  }
+  auto bundle = std::make_unique<ExtensionManagerQmlResources>();
+  const auto append = [](std::vector<unsigned char>& bytes, size_t value, size_t width) {
+    for (size_t remaining = width; remaining > 0; --remaining) {
+      bytes.push_back(static_cast<unsigned char>(value >> ((remaining - 1) * 8)));
+    }
+  };
+  for (size_t index : order) {
+    const auto& node = nodes[index];
+    append(bundle->tree, bundle->names.size(), 4);
+    append(bundle->names, node.name.size(), 2);
+    append(bundle->names, node.hash, 4);
+    for (unsigned char character : node.name) {
+      append(bundle->names, character, 2);
+    }
+    append(bundle->tree, node.file ? 0 : 2, 2);
+    if (node.file) {
+      append(bundle->tree, 0, 2);
+      append(bundle->tree, 1, 2);
+      append(bundle->tree, bundle->data.size(), 4);
+      append(bundle->data, node.content.size(), 4);
+      bundle->data.insert(bundle->data.end(), node.content.begin(), node.content.end());
+    } else {
+      append(bundle->tree, node.children.size(), 4);
+      append(bundle->tree, node.children.empty() ? 0 : nodes[node.children.front()].index, 4);
+    }
+  }
+  bundle->registered = api.register_data(1, bundle->tree.data(), bundle->names.data(), bundle->data.data());
+  return bundle->registered ? std::move(bundle) : nullptr;
+}
+
+using ExtensionManagerQmlSetSource = void(__cdecl*)(void*, const void*);
+ExtensionManagerQmlSetSource g_extension_manager_qml_set_source = nullptr;
+
+void __cdecl extension_manager_qml_set_source_hook(void* view, const void* url) {
+  const auto& api = extension_manager_qml_api();
+  if (!g_extension_manager_qml_set_source) {
+    return;
+  }
+  std::string source;
+  if (api.ready() && url) {
+    alignas(16) unsigned char bytes[64] = {};
+    api.url_bytes(url, bytes, 0);
+    source = api.take_bytes(bytes);
+  }
+  if (source != "qrc:/dialogs/ExtensionManagerDialog.qml" && source != "qrc:///dialogs/ExtensionManagerDialog.qml") {
+    g_extension_manager_qml_set_source(view, url);
+    return;
+  }
+  static auto resources = create_extension_manager_qml_resources();
+  if (!resources) {
+    g_extension_manager_qml_set_source(view, url);
+    return;
+  }
+  const std::string target = "qrc:/__darkmode_skp_extension_manager/dialogs/ExtensionManagerDialog.qml";
+  alignas(16) unsigned char name[64] = {}, themed_url[64] = {};
+  api.string_create(name, target.data(), static_cast<long long>(target.size()));
+  api.url_create(themed_url, name, 0);
+  g_extension_manager_qml_set_source(view, themed_url);
+  api.url_destroy(themed_url);
+  api.string_destroy(name);
+}
+
+bool install_extension_manager_qml_hook() {
+  if (g_extension_manager_qml_set_source) {
+    return true;
+  }
+  if (find_vtables_for_type(".?AVExtensionManagerDialogQt@@").empty() || !extension_manager_qml_api().ready()) {
+    return false;
+  }
+  constexpr const char* symbol = "?setSource@QQuickView@@QEAAXAEBVQUrl@@@Z";
+  const auto original = reinterpret_cast<ExtensionManagerQmlSetSource>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Quick.dll"), symbol));
+  const auto slots = find_main_import_iat_slots_for_symbols({symbol});
+  if (!original || slots.size() != 1 || !memory_readable(slots.front(), sizeof(void*)) ||
+      *slots.front() != reinterpret_cast<void*>(original)) {
+    return false;
+  }
+  DWORD protection = 0;
+  if (!VirtualProtect(slots.front(), sizeof(void*), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  g_extension_manager_qml_set_source = original;
+  *slots.front() = reinterpret_cast<void*>(&extension_manager_qml_set_source_hook);
+  DWORD unused = 0;
+  VirtualProtect(slots.front(), sizeof(void*), protection, &unused);
+  return true;
+}
+
+const char* extension_manager_style_script(bool enabled) {
+  return enabled
+    ? R"DARKMODE((function(){
+      if(!window.location||window.location.protocol!=='file:'||
+          !/\/dialogs\/extensionmanager\/extension_manager\.html$/i.test(window.location.pathname)){return;}
+      var key='__darkModeSkpExtensionManagerStyle';
+      var root=document.head||document.documentElement;
+      if(!root||document.getElementById(key)){return;}
+      var style=document.createElement('style');
+      style.id=key;
+      style.textContent=
+        'html,body{background-color:#2b2b2b!important;color:#d8dbe2!important;color-scheme:dark;}' +
+        '.page,.extension-list .em-extension,.su-option-list li{background:#2b2b2b!important;color:#d8dbe2!important;border-color:#444!important;}' +
+        '.footer,.page .em-header,.navbar-default,.modal-content,.modal-header,.modal-body,.modal-footer,.dropdown-menu,.panel,.panel-heading{background:#303030!important;color:#d8dbe2!important;border-color:#444!important;}' +
+        '.extension-list .em-extension-body,.well,.panel-body,.su-option-list .su-option-list-description{background:#242424!important;color:#d8dbe2!important;border-color:#444!important;}' +
+        '.extension-list .em-extension.selected .em-extension-header,.su-option-list li.selected .su-option-list-title{background:#4772b3!important;color:#fff!important;}' +
+        '.extension-list .em-extension.selected .em-extension-header .glyphicon,.extension-list .em-extension.selected .em-extension-header .extension-signed,.extension-list .em-extension.selected .em-extension-header .su-thumb-selected,.su-option-list li.selected .su-option-list-title .glyphicon{color:#fff!important;}' +
+        '.navbar-default .navbar-brand,.navbar-default .navbar-nav > li > a,.page .em-header a,.dropdown-menu > li > a,.close{color:#d8dbe2!important;}' +
+        '#navbar .glyphicon,.page .em-header .glyphicon,.glyphicon-chevron-right,.glyphicon-chevron-down{color:#d8dbe2!important;}' +
+        '#navbar .glyphicon-cog:before{color:#d8dbe2!important;text-shadow:none!important;}' +
+        '.navbar-default .navbar-nav > .active > a,.navbar-default .navbar-nav > .active > a:hover,.navbar-default .navbar-nav > .active > a:focus,.navbar-default .navbar-nav > .open > a,.dropdown-menu > li > a:hover,.dropdown-menu > li > a:focus{background:#3b3b3b!important;color:#fff!important;}' +
+        '.navbar-default .navbar-nav.su-tabs > li.active > a{border-bottom-color:#4772b3!important;}' +
+        '.navbar-default .navbar-nav.su-tabs > li > a:hover{border-bottom-color:#5684c4!important;}' +
+        '.footer{border-top-color:#4772b3!important;}' +
+        'a,.su-url-external{color:#709ce6!important;}a:hover,a:focus,.su-url-external:hover{color:#98bdf0!important;}' +
+        '.text-muted,.help-block{color:#a5abb5!important;}' +
+        '.form-control,select,textarea,input[type="text"],input[type="search"]{background:#1f1f1f!important;color:#d8dbe2!important;border-color:#555!important;}' +
+        '.form-control:focus{border-color:#709ce6!important;}' +
+        '.btn-default,.toggle-handle{background:#383838!important;color:#d8dbe2!important;border-color:#5a5a5a!important;}' +
+        '.btn-default:hover,.btn-default:focus,.btn-default:active,.btn-default.active{background:#484848!important;color:#fff!important;border-color:#777!important;}' +
+        '.btn-primary{background:#4772b3!important;color:#fff!important;border-color:#4772b3!important;}' +
+        '.btn-primary:hover,.btn-primary:focus{background:#5684c4!important;color:#fff!important;}' +
+        '.btn-primary:active{background:#385b8f!important;color:#fff!important;}' +
+        '.btn.toggle .toggle-on{background:#4772b3!important;color:#fff!important;}' +
+        '.btn.toggle .toggle-off{background:#555!important;color:#fff!important;}' +
+        '.btn.toggle .toggle-handle{background:#d8dbe2!important;border-color:#a5abb5!important;}' +
+        '.btn.toggle{border-color:#777!important;}' +
+        '.btn.disabled,.btn[disabled],fieldset[disabled] .btn,.form-control[disabled]{color:#a5abb5!important;}' +
+        '.su-ui input[type="radio"]::before{background:#4772b3!important;}' +
+        '.su-option-list .su-ui input[type="radio"]::before{background:#383838!important;color:#d8dbe2!important;}' +
+        '.su-option-list .selected .su-ui > input[type="radio"]:before{background:#fff!important;color:#4772b3!important;}' +
+        '.badge-info{background-color:#4772b3!important;color:#fff!important;}' +
+        '.su-alert:not(.su-alert-success):not(.su-alert-danger){border-color:#4772b3!important;}' +
+        '.su-dropzone{background:rgba(71,114,179,0.8)!important;}' +
+        '.dropdown-menu .divider,hr{background-color:#444!important;border-color:#444!important;}' +
+        '.extension-error-bag .extension-error-item,.alert-danger{background:#4a2d30!important;color:#ffc8c8!important;border-color:#805154!important;}' +
+        '.alert-warning{background:#443d26!important;color:#f0d98c!important;border-color:#786738!important;}' +
+        '.alert-info{background:#26344a!important;color:#c6d8f3!important;border-color:#4772b3!important;}' +
+        '.alert-success{background:#2c4333!important;color:#bce2c7!important;border-color:#4f785b!important;}' +
+        '::-webkit-scrollbar-track{background:#242424!important;}::-webkit-scrollbar-thumb{background:#606060!important;}';
+      root.appendChild(style);
+    })();)DARKMODE"
+    : R"DARKMODE((function(){
+      var style=document.getElementById('__darkModeSkpExtensionManagerStyle');
+      if(style&&style.parentNode){style.parentNode.removeChild(style);}
+    })();)DARKMODE";
 }
 
 bool execute_model_services_style(CefFrame* frame, bool enabled) {
@@ -10248,17 +12367,21 @@ bool execute_model_services_style(CefFrame* frame, bool enabled) {
     return false;
   }
 
-  const char* script = model_services_style_script(enabled);
+  const std::string url = cef_frame_url_lower(frame);
+  const bool extension_manager = is_extension_manager_url(url);
+  if (!extension_manager && !is_model_services_url(url)) {
+    return false;
+  }
+  const char* script = extension_manager ? extension_manager_style_script(enabled) : model_services_style_script(enabled);
   std::u16string script_utf16 = utf16_from_ascii(script);
-  std::u16string source_utf16 = u"dark-mode-skp://model-services";
+  std::u16string source_utf16 = extension_manager ? u"dark-mode-skp://extension-manager" : u"dark-mode-skp://model-services";
   CefString script_string = {script_utf16.data(), script_utf16.size(), nullptr};
   CefString source_string = {source_utf16.data(), source_utf16.size(), nullptr};
   frame->execute_java_script(frame, &script_string, &source_string, 1);
   return true;
 }
 
-bool is_main_executable_code_address(const void* address) {
-  HMODULE executable = GetModuleHandleW(nullptr);
+bool is_main_executable_code_address(const void* address, HMODULE executable = GetModuleHandleW(nullptr)) {
   const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
   const auto* dos_header = image_base && memory_readable(image_base, sizeof(IMAGE_DOS_HEADER))
     ? reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base)
@@ -10340,8 +12463,57 @@ const unsigned char* find_model_services_script_bridge_call(
   return call + 5 <= function_end && call[0] == 0xe8 ? call : nullptr;
 }
 
-void* find_atlast_webview_javascript_bridge() {
-  HMODULE executable = GetModuleHandleW(nullptr);
+const unsigned char* resolve_model_services_bridge_thunk(const unsigned char* target, HMODULE executable) {
+  for (size_t depth = 0; depth < 8; ++depth) {
+    if (!is_main_executable_code_address(target, executable) || !memory_readable(target, 5)) {
+      return nullptr;
+    }
+    if (target[0] != 0xe9) {
+      return target;
+    }
+    std::int32_t displacement = 0;
+    std::memcpy(&displacement, target + 1, sizeof(displacement));
+    target = reinterpret_cast<const unsigned char*>(reinterpret_cast<std::intptr_t>(target + 5) + displacement);
+  }
+  return nullptr;
+}
+
+const unsigned char* find_forwarded_model_services_script_bridge(
+  const unsigned char* instruction,
+  const unsigned char* function_end,
+  HMODULE executable
+) {
+  if (!instruction || !function_end || function_end - instruction < 13) {
+    return nullptr;
+  }
+  size_t lea_size = 0;
+  if (instruction[0] == 0x48 && instruction[1] == 0x8d && instruction[2] == 0x54 && instruction[3] == 0x24) {
+    lea_size = 5;
+  } else if (instruction[0] == 0x48 && instruction[1] == 0x8d && instruction[2] == 0x94 && instruction[3] == 0x24) {
+    lea_size = 8;
+  } else {
+    return nullptr;
+  }
+  const auto* receiver = instruction + lea_size;
+  if (function_end - receiver < 8 || receiver[0] != 0x48 || receiver[1] != 0x8b ||
+      receiver[2] != 0xce || receiver[3] != 0xe8) {
+    return nullptr;
+  }
+  std::int32_t displacement = 0;
+  std::memcpy(&displacement, receiver + 4, sizeof(displacement));
+  const auto* wrapper = resolve_model_services_bridge_thunk(
+    reinterpret_cast<const unsigned char*>(reinterpret_cast<std::intptr_t>(receiver + 8) + displacement), executable);
+  static constexpr unsigned char prefix[] = {0x48, 0x8b, 0x49, 0x08, 0x48, 0x85, 0xc9, 0x0f, 0x85};
+  if (!wrapper || !memory_readable(wrapper, 14) ||
+      !std::equal(std::begin(prefix), std::end(prefix), wrapper) || wrapper[13] != 0xc3) {
+    return nullptr;
+  }
+  std::memcpy(&displacement, wrapper + 9, sizeof(displacement));
+  return resolve_model_services_bridge_thunk(
+    reinterpret_cast<const unsigned char*>(reinterpret_cast<std::intptr_t>(wrapper + 13) + displacement), executable);
+}
+
+void* find_atlast_webview_javascript_bridge(HMODULE executable = GetModuleHandleW(nullptr)) {
   const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
   const auto* dos_header = image_base && memory_readable(image_base, sizeof(IMAGE_DOS_HEADER))
     ? reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base)
@@ -10389,14 +12561,15 @@ void* find_atlast_webview_javascript_bridge() {
     callers += 1;
     for (const auto* instruction = function_begin; instruction + 14 <= function_end; ++instruction) {
       const auto* call = find_model_services_script_bridge_call(instruction, function_end);
-      if (!call) {
-        continue;
+      const unsigned char* candidate = nullptr;
+      if (call) {
+        std::int32_t displacement = 0;
+        std::memcpy(&displacement, call + 1, sizeof(displacement));
+        candidate = reinterpret_cast<const unsigned char*>(reinterpret_cast<std::intptr_t>(call + 5) + displacement);
+      } else {
+        candidate = find_forwarded_model_services_script_bridge(instruction, function_end, executable);
       }
-      std::int32_t displacement = 0;
-      std::memcpy(&displacement, call + 1, sizeof(displacement));
-      const auto* candidate = reinterpret_cast<const unsigned char*>(
-        reinterpret_cast<std::intptr_t>(call + 5) + displacement);
-      if (!is_main_executable_code_address(candidate)) {
+      if (!is_main_executable_code_address(candidate, executable)) {
         continue;
       }
       bridge = const_cast<unsigned char*>(candidate);
@@ -10407,11 +12580,21 @@ void* find_atlast_webview_javascript_bridge() {
   return matches == 1 ? bridge : nullptr;
 }
 
-std::vector<void*> find_model_services_atlast_webviews(const QtLookup& lookup) {
+std::vector<const void*> extension_manager_dialog_vtables(HMODULE executable = GetModuleHandleW(nullptr)) {
+  std::vector<const void*> tables;
+  for (const char* type : {".?AVExtensionManagerDialog@@", ".?AVExtensionManagerDialogQt@@"}) {
+    const auto found = find_vtables_for_type(type, executable);
+    tables.insert(tables.end(), found.begin(), found.end());
+  }
+  return tables;
+}
+
+std::vector<void*> find_model_services_atlast_webviews(const QtLookup& lookup,
+  const std::vector<const void*>& dialog_types = find_vtables_for_type(".?AVCModelServiceDialog@@"),
+  const std::vector<const void*>& webview_vtables = find_vtables_for_type(".?AVWebView@webengine@atlast@@")) {
   constexpr size_t object_scan_bytes = 0x200;
   std::vector<void*> webviews;
-  const std::vector<const void*> webview_vtables = find_vtables_for_type(".?AVWebView@webengine@atlast@@");
-  const std::vector<void*> dialogs = find_overlays_dialog_widgets(lookup);
+  const std::vector<void*> dialogs = find_overlays_dialog_widgets(lookup, dialog_types);
   for (void* dialog : dialogs) {
     if (!pointer_looks_like_cpp_object(dialog)) {
       continue;
@@ -10466,11 +12649,50 @@ size_t apply_model_services_style_to_live_webviews(const QtLookup& lookup, bool 
   return applied;
 }
 
+size_t apply_extension_manager_style_to_live_webviews(const QtLookup& lookup, bool enabled) {
+  const auto webviews = find_model_services_atlast_webviews(lookup, extension_manager_dialog_vtables());
+  if (webviews.empty()) {
+    return 0;
+  }
+  static void* bridge = find_atlast_webview_javascript_bridge();
+  const auto script = utf16_from_ascii(extension_manager_style_script(enabled));
+  size_t applied = 0;
+  for (void* webview : webviews) {
+    applied += execute_atlast_webview_javascript(bridge, webview, script) ? 1 : 0;
+  }
+  return applied;
+}
+
+void prune_model_services_frames() {
+  std::vector<CefFrame*> expired;
+  {
+    std::lock_guard<std::mutex> lock(g_model_services_cef_mutex);
+    auto frame = g_model_services_frames.begin();
+    while (frame != g_model_services_frames.end()) {
+      CefFrame* current = *frame;
+      const bool valid = current && cef_struct_has_member(&current->base, offsetof(CefFrame, is_valid) + sizeof(current->is_valid)) &&
+        current->is_valid && reinterpret_cast<int(__fastcall*)(CefFrame*)>(current->is_valid)(current) != 0;
+      if (valid) {
+        ++frame;
+      } else {
+        expired.push_back(current);
+        frame = g_model_services_frames.erase(frame);
+      }
+    }
+  }
+  for (CefFrame* frame : expired) {
+    if (frame && cef_struct_has_member(&frame->base, sizeof(CefBaseRefCounted)) && frame->base.release) {
+      frame->base.release(&frame->base);
+    }
+  }
+}
+
 void track_model_services_frame(CefFrame* frame) {
-  if (!frame || !cef_struct_has_member(&frame->base, sizeof(CefBaseRefCounted)) || !frame->base.add_ref) {
+  if (!frame || !cef_struct_has_member(&frame->base, sizeof(CefBaseRefCounted)) || !frame->base.add_ref || !frame->base.release) {
     return;
   }
 
+  prune_model_services_frames();
   std::lock_guard<std::mutex> lock(g_model_services_cef_mutex);
   if (std::find(g_model_services_frames.begin(), g_model_services_frames.end(), frame) != g_model_services_frames.end()) {
     return;
@@ -10480,22 +12702,19 @@ void track_model_services_frame(CefFrame* frame) {
 }
 
 size_t apply_model_services_style_to_tracked_frames(bool enabled) {
-  std::lock_guard<std::mutex> lock(g_model_services_cef_mutex);
-  size_t applied = 0;
-  auto frame = g_model_services_frames.begin();
-  while (frame != g_model_services_frames.end()) {
-    CefFrame* current = *frame;
-    const bool valid = current && cef_struct_has_member(&current->base, offsetof(CefFrame, is_valid) + sizeof(current->is_valid)) &&
-      current->is_valid && reinterpret_cast<int(__fastcall*)(CefFrame*)>(current->is_valid)(current) != 0;
-    if (!valid) {
-      if (current && cef_struct_has_member(&current->base, sizeof(CefBaseRefCounted)) && current->base.release) {
-        current->base.release(&current->base);
-      }
-      frame = g_model_services_frames.erase(frame);
-      continue;
+  prune_model_services_frames();
+  std::vector<CefFrame*> frames;
+  {
+    std::lock_guard<std::mutex> lock(g_model_services_cef_mutex);
+    frames = g_model_services_frames;
+    for (CefFrame* frame : frames) {
+      frame->base.add_ref(&frame->base);
     }
-    applied += execute_model_services_style(current, enabled) ? 1 : 0;
-    ++frame;
+  }
+  size_t applied = 0;
+  for (CefFrame* frame : frames) {
+    applied += execute_model_services_style(frame, enabled) ? 1 : 0;
+    frame->base.release(&frame->base);
   }
   return applied;
 }
@@ -10518,7 +12737,7 @@ void __fastcall model_services_load_end_hook(CefLoadHandler* handler, void* brow
     cef_struct_has_member(&frame->base, offsetof(CefFrame, is_main) + sizeof(frame->is_main)) &&
     frame->is_main && frame->is_main(frame) != 0;
   const std::string frame_url = main_frame ? cef_frame_url_lower(frame) : "";
-  if (!main_frame || !is_model_services_url(frame_url)) {
+  if (!main_frame || (!is_model_services_url(frame_url) && !is_extension_manager_url(frame_url))) {
     return;
   }
   track_model_services_frame(frame);
@@ -10534,6 +12753,12 @@ bool hook_model_services_load_handler(CefClient* client) {
   }
 
   CefLoadHandler* handler = client->get_load_handler(client);
+  const auto release_handler = [](CefLoadHandler* value) {
+    if (value && cef_struct_has_member(&value->base, sizeof(CefBaseRefCounted)) && value->base.release) {
+      value->base.release(&value->base);
+    }
+  };
+  std::unique_ptr<CefLoadHandler, decltype(release_handler)> reference(handler, release_handler);
   if (!handler || !cef_struct_has_member(&handler->base, offsetof(CefLoadHandler, on_load_end) + sizeof(handler->on_load_end)) || !handler->on_load_end) {
     return false;
   }
@@ -10555,14 +12780,162 @@ bool hook_model_services_load_handler(CefClient* client) {
   DWORD unused_protection = 0;
   VirtualProtect(&handler->on_load_end, sizeof(handler->on_load_end), original_protection, &unused_protection);
   g_model_services_load_end_hooks.push_back({handler, original_proc});
+  static_cast<void>(reference.release());
   return true;
 }
 
-void** find_cef_import_iat_slot(const char* target_function_name) {
+struct ExtensionManagerLoadHandler {
+  CefLoadHandler api;
+  std::atomic<int> references{1};
+  CefLoadHandler* original = nullptr;
+
+  static ExtensionManagerLoadHandler* self(CefLoadHandler* handler) {
+    return reinterpret_cast<ExtensionManagerLoadHandler*>(handler);
+  }
+  static void __fastcall add_ref(CefBaseRefCounted* base) {
+    reinterpret_cast<ExtensionManagerLoadHandler*>(base)->references.fetch_add(1, std::memory_order_relaxed);
+  }
+  static int __fastcall release(CefBaseRefCounted* base) {
+    auto* handler = reinterpret_cast<ExtensionManagerLoadHandler*>(base);
+    if (handler->references.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+      return 0;
+    }
+    if (handler->original) {
+      handler->original->base.release(&handler->original->base);
+    }
+    delete handler;
+    return 1;
+  }
+  static int __fastcall has_one_ref(CefBaseRefCounted* base) {
+    return reinterpret_cast<ExtensionManagerLoadHandler*>(base)->references.load(std::memory_order_acquire) == 1;
+  }
+  static int __fastcall has_at_least_one_ref(CefBaseRefCounted* base) {
+    return reinterpret_cast<ExtensionManagerLoadHandler*>(base)->references.load(std::memory_order_acquire) > 0;
+  }
+  static void __fastcall loading(CefLoadHandler* handler, void* browser, int busy, int back, int forward) {
+    auto* original = self(handler)->original;
+    if (original && original->on_loading_state_change) {
+      reinterpret_cast<void(__fastcall*)(CefLoadHandler*, void*, int, int, int)>(original->on_loading_state_change)(
+        original, browser, busy, back, forward);
+    }
+  }
+  static void __fastcall start(CefLoadHandler* handler, void* browser, CefFrame* frame, int transition) {
+    auto* original = self(handler)->original;
+    if (original && original->on_load_start) {
+      reinterpret_cast<void(__fastcall*)(CefLoadHandler*, void*, CefFrame*, int)>(original->on_load_start)(
+        original, browser, frame, transition);
+    }
+  }
+  static void __fastcall end(CefLoadHandler* handler, void* browser, CefFrame* frame, int status) {
+    auto* original = self(handler)->original;
+    if (original && original->on_load_end) {
+      original->on_load_end(original, browser, frame, status);
+    }
+    if (!frame || !cef_struct_has_member(&frame->base, offsetof(CefFrame, get_url) + sizeof(frame->get_url)) ||
+        !frame->is_main || !frame->is_main(frame) || !frame->is_valid ||
+        !reinterpret_cast<int(__fastcall*)(CefFrame*)>(frame->is_valid)(frame) ||
+        !is_extension_manager_url(cef_frame_url_lower(frame))) {
+      return;
+    }
+    track_model_services_frame(frame);
+    if (InterlockedCompareExchange(&g_model_services_cef_observer_only, 0, 0) == 0) {
+      execute_model_services_style(frame, InterlockedCompareExchange(&g_dark_mode_enabled, 0, 0) != 0);
+    }
+  }
+  static void __fastcall error(CefLoadHandler* handler, void* browser, CefFrame* frame, int code,
+                                const CefString* message, const CefString* url) {
+    auto* original = self(handler)->original;
+    if (original && original->on_load_error) {
+      reinterpret_cast<void(__fastcall*)(CefLoadHandler*, void*, CefFrame*, int, const CefString*, const CefString*)>(
+        original->on_load_error)(original, browser, frame, code, message, url);
+    }
+  }
+};
+
+struct ExtensionManagerClientHook {
+  CefLoadHandler*(__fastcall* getter)(CefClient*) = nullptr;
+  int(__fastcall* release)(CefBaseRefCounted*) = nullptr;
+};
+std::mutex g_extension_manager_clients_mutex;
+std::unordered_map<CefClient*, std::shared_ptr<ExtensionManagerClientHook>> g_extension_manager_clients;
+
+int __fastcall extension_manager_client_release(CefBaseRefCounted* base) {
+  auto* client = reinterpret_cast<CefClient*>(base);
+  std::shared_ptr<ExtensionManagerClientHook> hook;
+  {
+    std::lock_guard<std::mutex> lock(g_extension_manager_clients_mutex);
+    const auto found = g_extension_manager_clients.find(client);
+    if (found == g_extension_manager_clients.end()) {
+      return 0;
+    }
+    hook = found->second;
+  }
+  const int destroyed = hook->release(base);
+  if (destroyed) {
+    std::lock_guard<std::mutex> lock(g_extension_manager_clients_mutex);
+    const auto found = g_extension_manager_clients.find(client);
+    if (found != g_extension_manager_clients.end() && found->second == hook) {
+      g_extension_manager_clients.erase(found);
+    }
+  }
+  return destroyed;
+}
+
+CefLoadHandler* __fastcall extension_manager_get_load_handler(CefClient* client) {
+  std::shared_ptr<ExtensionManagerClientHook> hook;
+  {
+    std::lock_guard<std::mutex> lock(g_extension_manager_clients_mutex);
+    const auto found = g_extension_manager_clients.find(client);
+    if (found == g_extension_manager_clients.end()) {
+      return nullptr;
+    }
+    hook = found->second;
+  }
+  CefLoadHandler* original = hook->getter ? hook->getter(client) : nullptr;
+  if (original && (!cef_struct_has_member(&original->base, sizeof(CefLoadHandler)) || !original->base.release)) {
+    return original;
+  }
+  auto* handler = new (std::nothrow) ExtensionManagerLoadHandler;
+  if (!handler) {
+    return original;
+  }
+  handler->original = original;
+  handler->api.base = {sizeof(CefLoadHandler), ExtensionManagerLoadHandler::add_ref, ExtensionManagerLoadHandler::release,
+    ExtensionManagerLoadHandler::has_one_ref, ExtensionManagerLoadHandler::has_at_least_one_ref};
+  handler->api.on_loading_state_change = reinterpret_cast<void*>(&ExtensionManagerLoadHandler::loading);
+  handler->api.on_load_start = reinterpret_cast<void*>(&ExtensionManagerLoadHandler::start);
+  handler->api.on_load_end = &ExtensionManagerLoadHandler::end;
+  handler->api.on_load_error = reinterpret_cast<void*>(&ExtensionManagerLoadHandler::error);
+  return &handler->api;
+}
+
+bool hook_extension_manager_client(CefClient* client) {
+  if (!client || !cef_struct_has_member(&client->base, sizeof(CefClient)) || !client->base.release) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_extension_manager_clients_mutex);
+  if (g_extension_manager_clients.find(client) != g_extension_manager_clients.end()) {
+    return client->get_load_handler == &extension_manager_get_load_handler;
+  }
+  auto hook = std::make_shared<ExtensionManagerClientHook>();
+  hook->getter = client->get_load_handler;
+  hook->release = client->base.release;
+  DWORD protection = 0;
+  if (!VirtualProtect(client, sizeof(CefClient), PAGE_READWRITE, &protection)) {
+    return false;
+  }
+  g_extension_manager_clients.emplace(client, hook);
+  client->get_load_handler = &extension_manager_get_load_handler;
+  client->base.release = &extension_manager_client_release;
+  DWORD unused = 0;
+  VirtualProtect(client, sizeof(CefClient), protection, &unused);
+  return true;
+}
+
+void** find_cef_import_iat_slot(const char* target_function_name, HMODULE executable = GetModuleHandleW(nullptr)) {
   if (!target_function_name || target_function_name[0] == '\0') {
     return nullptr;
   }
-  HMODULE executable = GetModuleHandleW(nullptr);
   const auto* image_base = reinterpret_cast<const unsigned char*>(executable);
   const auto* dos_header = image_base && memory_readable(image_base, sizeof(IMAGE_DOS_HEADER))
     ? reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base)
@@ -10717,6 +13090,16 @@ bool install_qmenu_popup_hook() {
   return true;
 }
 
+bool spin_box_palette_event(const void* event) {
+  static const auto event_type = reinterpret_cast<int(__cdecl*)(const void*)>(
+    GetProcAddress(GetModuleHandleW(L"Qt6Core.dll"), "?type@QEvent@@QEBA?AW4Type@1@XZ"));
+  if (!event || !event_type) {
+    return true;
+  }
+  const int type = event_type(event);
+  return type == 38 || type == 39 || type == 98 || type == 100 || type == 210;
+}
+
 void __fastcall focus_returner_double_spin_box_change_event_hook(void* spin_box, void* event) {
   QWidgetChangeEventFn original_proc = nullptr;
   {
@@ -10729,13 +13112,16 @@ void __fastcall focus_returner_double_spin_box_change_event_hook(void* spin_box,
   }
 
   if (!spin_box || InterlockedCompareExchange(&g_dark_mode_enabled, 0, 0) == 0 ||
-      g_focus_returner_double_spin_box_palette_applying) {
+      g_focus_returner_double_spin_box_palette_applying || !spin_box_palette_event(event)) {
     return;
   }
 
   g_focus_returner_double_spin_box_palette_applying = true;
   const QtLookup& lookup = resolve_qt_lookup();
-  static_cast<void>(apply_clicked_palette_to_widget(lookup, spin_box, true));
+  if (!widget_theme_stamp(lookup, spin_box, "_darkmode_spin_palette", false) &&
+      apply_clicked_palette_to_widget(lookup, spin_box, true)) {
+    widget_theme_stamp(lookup, spin_box, "_darkmode_spin_palette", true);
+  }
   g_focus_returner_double_spin_box_palette_applying = false;
 }
 
@@ -10844,8 +13230,7 @@ int __fastcall cef_browser_host_create_browser_hook(
   void* extra_info,
   void* request_context
 ) {
-  if (client) {
-  }
+  static_cast<void>(hook_extension_manager_client(client));
   return g_original_cef_browser_create
     ? g_original_cef_browser_create(window_info, client, url, settings, extra_info, request_context)
     : 0;
@@ -10859,8 +13244,7 @@ void* __fastcall cef_browser_host_create_browser_sync_hook(
   void* extra_info,
   void* request_context
 ) {
-  if (client) {
-  }
+  static_cast<void>(hook_extension_manager_client(client));
   return g_original_cef_browser_create_sync
     ? g_original_cef_browser_create_sync(window_info, client, url, settings, extra_info, request_context)
     : nullptr;
@@ -10873,8 +13257,7 @@ void* __fastcall cef_browser_view_create_hook(
   void* extra_info,
   void* request_context
 ) {
-  if (client) {
-  }
+  static_cast<void>(hook_extension_manager_client(client));
   return g_original_cef_browser_view_create
     ? g_original_cef_browser_view_create(client, url, settings, extra_info, request_context)
     : nullptr;
@@ -11059,16 +13442,19 @@ bool probe_qt_stage(int stage) {
     if (apply_clicked_palette_to_widget(lookup, targets[index], stage == 45)) {
       applied_count += 1;
     }
-    if (lookup.widget_update_proc && lookup.widget_repaint_proc) {
+    if (lookup.widget_update_proc) {
       reinterpret_cast<QtWidgetNoArgFn>(lookup.widget_update_proc)(targets[index]);
+    } else if (lookup.widget_repaint_proc) {
       reinterpret_cast<QtWidgetNoArgFn>(lookup.widget_repaint_proc)(targets[index]);
     }
   }
 
   const std::vector<HWND> tray_roots = find_tray_marker_hwnds();
+  std::unordered_set<HWND> redraw_roots;
   for (HWND tray_root : tray_roots) {
-    for (HWND current = tray_root; current; current = GetParent(current)) {
-      RedrawWindow(current, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    const HWND root = GetAncestor(tray_root, GA_ROOT);
+    if (redraw_roots.insert(root ? root : tray_root).second) {
+      RedrawWindow(root ? root : tray_root, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
   }
 
@@ -11084,6 +13470,7 @@ bool call_qt_stylesheet(bool enabled) {
   if (enabled) {
     prepare_dialog_show_types();
   }
+  const bool workspace_style_hook_ok = set_modern_workspace_style_hook(tags_header_lookup, enabled);
   const bool qt_color_scheme_ok = apply_qt_color_scheme(tags_header_lookup, enabled);
   size_t tag_header_color_count = 0;
   size_t entity_info_input_surface_count = 0;
@@ -11123,6 +13510,8 @@ bool call_qt_stylesheet(bool enabled) {
     entity_info_input_surface_count = apply_entity_info_input_surface(tags_header_lookup, enabled);
   }
   static_cast<void>(apply_existing_omnibar_dialog_styles(tags_header_lookup, enabled));
+  static_cast<void>(apply_existing_notification_styles(tags_header_lookup, enabled));
+  const size_t workspace_style_count = apply_modern_workspace_styles(tags_header_lookup, enabled);
   const bool model_services_hook_ok = InterlockedCompareExchange(&g_model_services_cef_hook_installed, 0, 0) != 0;
   const size_t measurements_entry_pad_count = install_measurements_entry_pad_subclasses(enabled);
   const bool applied = palette_ok && windows_ok;
@@ -11134,6 +13523,7 @@ bool call_qt_stylesheet(bool enabled) {
   size_t about_sketchup_palette_count = 0;
   InterlockedExchange(&g_dark_mode_enabled, enabled ? 1 : 0);
   model_services_live_view_count = apply_model_services_style_to_live_webviews(tags_header_lookup, enabled);
+  const size_t extension_manager_view_count = apply_extension_manager_style_to_live_webviews(tags_header_lookup, enabled);
   if (applied) {
     InterlockedExchange(&g_model_services_cef_observer_only, 0);
     model_services_frame_count = apply_model_services_style_to_tracked_frames(enabled);
@@ -11150,14 +13540,13 @@ bool call_qt_stylesheet(bool enabled) {
   }
   if (page_tabs_search_icon_count > 0) {
     InterlockedExchange(&g_icon_theme_page_tabs_search_icon_count, static_cast<LONG>(page_tabs_search_icon_count));
-    if (icon_theme_enabled()) {
-      write_icon_theme_status("enabled");
-    }
   }
   set_theme_info("Dark Mode SKP helper main " + std::string(enabled ? "dark" : "clear") +
     ": palette=" + std::to_string(palette_ok ? 1 : 0) +
     " windows=" + std::to_string(windows_ok ? 1 : 0) +
     " qt-color-scheme=" + std::to_string(qt_color_scheme_ok ? 1 : 0) +
+    " workspace-style-hook=" + std::to_string(workspace_style_hook_ok ? 1 : 0) +
+    " workspace-styles=" + std::to_string(workspace_style_count) +
     " vcb=" + std::to_string(vcb_ok ? 1 : 0) +
     " vcb-paint=" + std::to_string(vcb_paint_hook_ok ? 1 : 0) +
     " overlays-hook=" + std::to_string(model_services_hook_ok ? 1 : 0) +
@@ -11168,6 +13557,7 @@ bool call_qt_stylesheet(bool enabled) {
     " overlays-refresh=" + std::to_string(model_services_refresh_count) +
     " overlays-frames=" + std::to_string(model_services_frame_count) +
     " overlays-live-view=" + std::to_string(model_services_live_view_count) +
+    " extension-manager-live-view=" + std::to_string(extension_manager_view_count) +
     " about=" + std::to_string(about_sketchup_palette_count) +
     " tabs=" + std::to_string(tab_bar_palette_count) +
     " toolbar-flat-border=" + std::to_string(toolbar_style_stats.surface_style_count) +
@@ -11194,6 +13584,7 @@ extern "C" __declspec(dllexport) int darkmode_skp_initialize() {
   InterlockedExchange(&g_model_services_cef_hook_installed, model_services_observer_installed ? 1 : 0);
   const bool about_observer_installed = install_about_sketchup_window_hook();
   const bool qmenu_observer_installed = install_qmenu_window_hook();
+  static_cast<void>(install_extension_manager_qml_hook());
   static_cast<void>(install_focus_returner_double_spin_box_change_event_hook());
   static_cast<void>(install_tray_hide_icon_add_file_hook());
   static_cast<void>(install_page_tabs_search_refresh_hook());
@@ -11218,6 +13609,14 @@ extern "C" __declspec(dllexport) int darkmode_skp_theme_info(char* buffer, int b
   }
 
   const std::string info = theme_info() +
+    " workspace-dark=" + std::to_string(g_modern_workspace_dark ? 1 : 0) +
+    " workspace-frame-module=" + std::to_string(GetModuleHandleW(L"kddockwidgets-qt6.dll") ? 1 : 0) +
+    " workspace-frame-hook=" + std::to_string(g_modern_workspace_frame_hook.slot &&
+      *g_modern_workspace_frame_hook.slot == reinterpret_cast<void*>(&modern_workspace_frame_pen_hook) ? 1 : 0) +
+    " workspace-frame-calls=" + std::to_string(InterlockedCompareExchange(&g_modern_workspace_frame_calls, 0, 0)) +
+    " workspace-frame-tints=" + std::to_string(InterlockedCompareExchange(&g_modern_workspace_frame_tints, 0, 0)) +
+    " workspace-title-draws=" + std::to_string(InterlockedCompareExchange(&g_modern_workspace_title_draws, 0, 0)) +
+    " workspace-tab-draws=" + std::to_string(InterlockedCompareExchange(&g_modern_workspace_tab_draws, 0, 0)) +
     " toolbar-title-draws=" + std::to_string(InterlockedCompareExchange(&g_toolbar_title_draw_count, 0, 0)) +
     " toolbar-close-draws=" + std::to_string(InterlockedCompareExchange(&g_toolbar_close_draw_count, 0, 0)) +
     " scene-search-draws=" + std::to_string(InterlockedCompareExchange(&g_scene_search_draw_count, 0, 0));

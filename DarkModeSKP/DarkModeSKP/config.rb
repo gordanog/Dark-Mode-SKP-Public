@@ -5,7 +5,7 @@ module DarkModeSKP
 
   PLUGIN_NAME = 'Dark Mode SKP'
   PLUGIN_ID   = 'com.ag.dark_mode_skp'
-  VERSION     = '0.4'
+  VERSION     = '0.5'
   MINIMUM_SKETCHUP_VERSION = 2024
   UNSUPPORTED_ENVIRONMENT_MESSAGE = "Supports only SketchUp #{MINIMUM_SKETCHUP_VERSION}+ on Windows"
 
